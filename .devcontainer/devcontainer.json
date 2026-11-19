@@ -1,22 +1,8 @@
 {
-  "name": "HotLanka Cloud Studio",
-  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "name": "HotLanka Cloud PC",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
   "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {}
+    "ghcr.io/devcontainers/features/desktop-lite:1": {}
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg xvfb x11vnc websockify novnc openbox wget && wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && sudo apt-get install -y ./google-chrome-stable_current_amd64.deb && rm -f google-chrome-stable_current_amd64.deb && pip install flask telethon pillow opencv-python-headless numpy",
-  "postStartCommand": "bash start.sh",
-  "forwardPorts": [5000, 6080],
-  "portsAttributes": {
-    "5000": {
-      "label": "HotLanka Dashboard",
-      "visibility": "private",
-      "onAutoForward": "openBrowser"
-    },
-    "6080": {
-      "label": "Cloud Browser VNC",
-      "visibility": "private",
-      "onAutoForward": "silent"
-    }
-  }
+  "forwardPorts": [6080, 8080]
 }
