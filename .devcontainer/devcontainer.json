@@ -1,0 +1,22 @@
+{
+  "name": "HotLanka Cloud Studio",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/desktop-lite:1": {
+      "password": "password",
+      "webPort": "6080"
+    }
+  },
+  "forwardPorts": [6080, 5000],
+  "portsAttributes": {
+    "6080": {
+      "label": "Cloud Desktop (Chrome & VDH)",
+      "onAutoForward": "notify"
+    },
+    "5000": {
+      "label": "HotLanka Web Dashboard",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "bash setup.sh"
+}
