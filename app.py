@@ -1,7 +1,7 @@
 import os
 import re
 import time
-import json
+import glob
 import base64
 import asyncio
 import threading
@@ -21,8 +21,7 @@ API_HASH = "b1d1c146f1ec4d51fbae1ca15acd51e7"
 BASE_DIR = os.path.expanduser("~")
 DOWNLOADS_FOLDER = os.path.join(BASE_DIR, "Downloads")
 VIDEOS_FOLDER = os.path.join(BASE_DIR, "Edited")
-PREVIEWS_FOLDER = os.path.join(VIDEOS_FOLDER, "preview")
-COMPLETED_FOLDER = os.path.join(VIDEOS_FOLDER, "completed")
+THUMBS_FOLDER = os.path.join(VIDEOS_FOLDER, "thumbs_5s")
 TEMP_FOLDER = os.path.join(VIDEOS_FOLDER, "temp")
 SESSION_PATH = os.path.join(BASE_DIR, "telethon_cloud_session")
 
@@ -30,24 +29,22 @@ FILE_STORE_BOT = "LankaFile_bot"
 POST_BOT = "HotLanka_Bot"
 DEFAULT_CAPTION = "🔥Hot Lanka Exclusive 🔥"
 INTRO_SKIP_SECONDS = 8.5
+THUMB_INTERVAL_SEC = 5  # Extract 1 HD frame every 5 seconds
 
-# Sri Lanka Timezone (UTC+5:30)
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 # =================================================
 
-for d in [DOWNLOADS_FOLDER, VIDEOS_FOLDER, PREVIEWS_FOLDER, COMPLETED_FOLDER, TEMP_FOLDER]:
+for d in [DOWNLOADS_FOLDER, VIDEOS_FOLDER, THUMBS_FOLDER, TEMP_FOLDER]:
     os.makedirs(d, exist_ok=True)
 
 app_flask = Flask(__name__)
 
-# Global States
 editor_state = {"active": False, "file": "", "step": "Idle"}
 batch_state = {
     "running": False,
     "done": False,
     "msg": "Ready",
     "pct": 0,
-    "speed": "",
     "current_file": None,
     "completed_files": [],
     "logs": []
@@ -71,7 +68,12 @@ def clean_temp_folder():
             except Exception:
                 pass
 
-# ================= AUTO VIDEO EDITOR (LOGIC FROM editor.py) =================
+def get_video_thumb_dir(filename):
+    safe_dir = os.path.join(THUMBS_FOLDER, filename)
+    os.makedirs(safe_dir, exist_ok=True)
+    return safe_dir
+
+# ================= AUTO VIDEO EDITOR & 5-SEC HD THUMB GENERATOR =================
 def detect_black_bars_and_crop(video_path, check_sec=9):
     try:
         cap = cv2.VideoCapture(video_path)
@@ -100,11 +102,28 @@ def detect_black_bars_and_crop(video_path, check_sec=9):
         pass
     return None
 
+def generate_5sec_hd_thumbs(video_path, filename):
+    """Extract crisp HD JPEG frames every 5 seconds from the edited video"""
+    t_dir = get_video_thumb_dir(filename)
+    for old in os.listdir(t_dir):
+        try:
+            os.remove(os.path.join(t_dir, old))
+        except Exception:
+            pass
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-vf", f"fps=1/{THUMB_INTERVAL_SEC},scale='min(960,iw)':-2",
+        "-q:v", "2",
+        os.path.join(t_dir, "frame_%04d.jpg")
+    ]
+    subprocess.run(cmd, check=True)
+
 def process_downloaded_video(raw_path):
     filename = os.path.basename(raw_path)
     out_path = os.path.join(VIDEOS_FOLDER, filename)
     temp_out = os.path.join(TEMP_FOLDER, f"edit_{filename}")
-    proxy_out = os.path.join(PREVIEWS_FOLDER, f"{filename}.mp4")
 
     editor_state["active"] = True
     editor_state["file"] = filename
@@ -124,17 +143,9 @@ def process_downloaded_video(raw_path):
                 os.remove(out_path)
             os.rename(temp_out, out_path)
 
-            # Generate lightweight 360p fast-seek proxy for instant zero-lag preview
-            editor_state["step"] = "Generating fast preview..."
-            proxy_cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", out_path, "-vf", "scale=-2:360",
-                "-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",
-                "-g", "15", "-an", proxy_out
-            ]
-            subprocess.run(proxy_cmd, check=True)
+            editor_state["step"] = "Extracting 5s HD Thumbnails..."
+            generate_5sec_hd_thumbs(out_path, filename)
 
-            # Remove raw download to save cloud disk space
             if os.path.exists(raw_path):
                 os.remove(raw_path)
             add_log(f"Ready for upload: {filename}")
@@ -165,7 +176,7 @@ def background_download_watcher():
             pass
         time.sleep(2.0)
 
-# ================= TELETHON BATCH UPLOADER (LOGIC FROM uploader.py) =================
+# ================= TELETHON BATCH UPLOADER =================
 def extract_video_metadata_and_thumb(video_path, task_idx):
     duration, width, height = 0, 0, 0
     video_thumb_path = os.path.join(TEMP_FOLDER, f"auto_thumb_{task_idx}_{int(time.time())}.jpg")
@@ -256,6 +267,7 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
 
                 f_name = item['fileName']
                 caption = item.get('caption', '').strip() or DEFAULT_CAPTION
+                selected_thumb_file = item.get('selectedThumbFile', '')
                 image_b64 = item.get('imageBase64', '')
                 file_path = os.path.join(VIDEOS_FOLDER, f_name)
 
@@ -265,12 +277,11 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                 batch_state["current_file"] = f_name
                 batch_state["msg"] = f"[{idx}/{total}] Step 1/4: Preparing..."
                 batch_state["pct"] = 5
-                batch_state["speed"] = ""
 
                 post_photo_custom = None
                 if image_b64 and "," in image_b64:
                     try:
-                        post_photo_custom = os.path.join(TEMP_FOLDER, f"thumb_{idx}_{int(time.time())}.jpg")
+                        post_photo_custom = os.path.join(TEMP_FOLDER, f"paste_{idx}_{int(time.time())}.jpg")
                         img_bytes = base64.b64decode(image_b64.split(",")[1])
                         with open(post_photo_custom, "wb") as f_img:
                             f_img.write(img_bytes)
@@ -278,6 +289,10 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                             im.convert('RGB').save(post_photo_custom, quality=95)
                     except Exception:
                         post_photo_custom = None
+                elif selected_thumb_file:
+                    cand = os.path.join(get_video_thumb_dir(f_name), selected_thumb_file)
+                    if os.path.exists(cand):
+                        post_photo_custom = cand
 
                 duration, width, height, auto_thumb = extract_video_metadata_and_thumb(file_path, idx)
 
@@ -299,7 +314,6 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                     speed_mb = (cur / (1024 * 1024)) / elapsed
                     pct = int((cur / tot) * 80)
                     batch_state["pct"] = pct
-                    batch_state["speed"] = f"{speed_mb:.1f} MB/s"
                     batch_state["msg"] = f"[{idx}/{total}] Step 2/4: Uploading... ({speed_mb:.1f} MB/s)"
 
                 uploaded_file = await client.upload_file(
@@ -321,7 +335,6 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
 
                 batch_state["msg"] = f"[{idx}/{total}] Step 3/4: Fetching Link..."
                 batch_state["pct"] = 88
-                batch_state["speed"] = ""
                 extracted_link = await get_fresh_link_telethon(client, last_bot_msg_id, wait_seconds=35)
 
                 if extracted_link and not stop_flag:
@@ -338,13 +351,21 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                     else:
                         await client.send_message(POST_BOT, message=post_payload, schedule=current_item_schedule)
 
-                    # Delete processed video & proxy to keep cloud storage clean (under 15GB limit)
-                    for p in [file_path, os.path.join(PREVIEWS_FOLDER, f"{f_name}.mp4"), post_photo_custom, auto_thumb]:
-                        if p and os.path.exists(p):
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
+                    # Clean up video + 5s thumbnails folder
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    t_dir = get_video_thumb_dir(f_name)
+                    for tf in os.listdir(t_dir):
+                        try:
+                            os.remove(os.path.join(t_dir, tf))
+                        except Exception:
+                            pass
+                    try:
+                        os.rmdir(t_dir)
+                    except Exception:
+                        pass
+                    if auto_thumb and os.path.exists(auto_thumb):
+                        os.remove(auto_thumb)
 
                     batch_state["completed_files"].append(f_name)
                     batch_state["pct"] = 100
@@ -378,35 +399,9 @@ def natural_sort_key(s):
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app_flask.route('/preview/<path:filename>')
-def serve_preview(filename):
-    proxy_name = f"{filename}.mp4"
-    if os.path.exists(os.path.join(PREVIEWS_FOLDER, proxy_name)):
-        return send_from_directory(PREVIEWS_FOLDER, proxy_name)
-    return send_from_directory(VIDEOS_FOLDER, filename)
-
-@app_flask.route('/api/capture_frame', methods=['POST'])
-def capture_frame():
-    data = request.json or {}
-    filename = data.get("filename", "")
-    timestamp = float(data.get("timestamp", 0.0))
-    video_path = os.path.join(VIDEOS_FOLDER, filename)
-
-    if not os.path.exists(video_path):
-        return jsonify({"error": "Video not found"}), 404
-
-    try:
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-        ret, frame = cap.read()
-        cap.release()
-        if ret and frame is not None:
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            b64_str = base64.b64encode(buffer).decode('utf-8')
-            return jsonify({"imageBase64": f"data:image/jpeg;base64,{b64_str}"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"error": "Frame capture failed"}), 500
+@app_flask.route('/thumb/<path:filename>/<thumbname>')
+def serve_thumb(filename, thumbname):
+    return send_from_directory(get_video_thumb_dir(filename), thumbname)
 
 @app_flask.route('/api/get_videos')
 def get_videos():
@@ -420,7 +415,16 @@ def get_videos():
         for f in sorted(raw_files, key=natural_sort_key):
             full_p = os.path.join(VIDEOS_FOLDER, f)
             size_mb = f"{os.path.getsize(full_p) / (1024 * 1024):.1f} MB"
-            v_list.append({'fileName': f, 'size': size_mb})
+            t_dir = get_video_thumb_dir(f)
+            thumbs = sorted([t for t in os.listdir(t_dir) if t.endswith('.jpg')])
+            # If thumbs weren't generated yet for an existing video, generate now
+            if not thumbs:
+                try:
+                    generate_5sec_hd_thumbs(full_p, f)
+                    thumbs = sorted([t for t in os.listdir(t_dir) if t.endswith('.jpg')])
+                except Exception:
+                    thumbs = []
+            v_list.append({'fileName': f, 'size': size_mb, 'thumbs': thumbs})
     return jsonify({"videos": v_list, "editor": editor_state})
 
 @app_flask.route('/api/start_batch', methods=['POST'])
@@ -451,13 +455,13 @@ def stop_batch():
 def get_status():
     return jsonify(batch_state)
 
-# ================= WEB DASHBOARD UI (SIMPLE ENGLISH + INSTANT FRAME GRABBER) =================
+# ================= WEB DASHBOARD UI (5s HD THUMBNAIL SLIDER + HOVER ZOOM) =================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>HotLanka Cloud Dashboard</title>
+    <title>HotLanka Cloud Studio</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -468,7 +472,7 @@ HTML_TEMPLATE = r"""
             padding: 18px;
         }
         .container {
-            max-width: 960px;
+            max-width: 1020px;
             margin: 0 auto;
             background: #0f0b1e;
             border: 1px solid #24164a;
@@ -540,58 +544,78 @@ HTML_TEMPLATE = r"""
         }
         .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
         .btn-danger { background: #ef4444; border: none; color: #fff; display: none; }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+
+        .video-list {
+            display: flex;
+            flex-direction: column;
             gap: 12px;
             margin-bottom: 16px;
         }
         .card {
             background: #130d29;
             border: 1px solid #26184f;
-            border-radius: 10px;
-            padding: 12px;
+            border-radius: 11px;
+            padding: 12px 14px;
             display: flex;
             flex-direction: column;
-            gap: 9px;
+            gap: 10px;
         }
-        .card.done { border-color: #22c55e; opacity: 0.6; }
+        .card.done { border-color: #22c55e; opacity: 0.55; }
         .card-head {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-size: 12.5px;
+            font-size: 13px;
         }
-        .file-title {
-            font-weight: 600;
-            color: #e2e8f0;
-            max-width: 310px;
+        .file-title { font-weight: 600; color: #e2e8f0; }
+
+        /* 5-Second HD Thumbnail Slider */
+        .slider-wrap {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding: 6px;
+            background: #080612;
+            border: 1px solid #221545;
+            border-radius: 8px;
+        }
+        .slider-wrap::-webkit-scrollbar { height: 7px; }
+        .slider-wrap::-webkit-scrollbar-thumb { background: #4c2f8a; border-radius: 6px; }
+
+        .slide-item {
+            position: relative;
+            flex-shrink: 0;
+            width: 128px;
+            height: 74px;
+            border-radius: 6px;
             overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: transform 0.15s, border-color 0.15s;
         }
-        .player-row {
+        .slide-item:hover { border-color: #a855f7; transform: scale(1.03); }
+        .slide-item.active { border-color: #22c55e; box-shadow: 0 0 10px rgba(34, 197, 94, 0.5); }
+        .slide-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .time-tag {
+            position: absolute;
+            bottom: 3px;
+            right: 4px;
+            background: rgba(0,0,0,0.78);
+            color: #f8fafc;
+            font-size: 10px;
+            font-family: monospace;
+            padding: 1px 5px;
+            border-radius: 4px;
+        }
+
+        .bottom-row {
             display: flex;
             gap: 10px;
             align-items: center;
         }
-        video {
-            width: 210px;
-            height: 118px;
-            background: #000;
-            border-radius: 7px;
-            border: 1px solid #2e1d5e;
-        }
-        .thumb-side {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            align-items: center;
-        }
-        .thumb-box {
-            width: 100%;
-            height: 82px;
+        .selected-preview-box {
+            width: 112px;
+            height: 64px;
             border: 1px dashed #4c2f8a;
             border-radius: 7px;
             background: #080612;
@@ -600,23 +624,29 @@ HTML_TEMPLATE = r"""
             justify-content: center;
             cursor: pointer;
             overflow: hidden;
+            flex-shrink: 0;
             position: relative;
         }
-        .thumb-box:focus { border-color: #a855f7; }
-        .thumb-box img { width: 100%; height: 100%; object-fit: cover; display: none; }
-        .thumb-hint { font-size: 11px; color: #8b76b8; text-align: center; padding: 4px; }
-        .btn-cap {
-            width: 100%;
-            background: #231647;
-            border: 1px solid #472d8c;
-            color: #d8b4fe;
-            padding: 5px;
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: 600;
-            cursor: pointer;
+        .selected-preview-box:focus { border-color: #a855f7; }
+        .selected-preview-box img { width: 100%; height: 100%; object-fit: cover; display: none; }
+        .hint-txt { font-size: 10px; color: #8b76b8; text-align: center; padding: 3px; }
+        .cap-input { flex: 1; }
+
+        /* Large Hover Zoom Popup */
+        .hover-zoom-popup {
+            position: fixed;
+            pointer-events: none;
+            z-index: 9999;
+            background: #0f0b1e;
+            border: 2px solid #a855f7;
+            border-radius: 10px;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.92);
+            max-width: 440px;
+            max-height: 320px;
+            object-fit: contain;
+            display: none;
         }
-        .btn-cap:hover { background: #342169; }
+
         .progress-section {
             background: #080612;
             border: 1px solid #1f143d;
@@ -655,6 +685,8 @@ HTML_TEMPLATE = r"""
     </style>
 </head>
 <body>
+    <img id="hover_zoom" class="hover-zoom-popup" src="">
+
     <div class="container">
         <div class="top-bar">
             <span class="title">HotLanka Cloud Studio</span>
@@ -673,7 +705,7 @@ HTML_TEMPLATE = r"""
             <button class="btn btn-danger" id="stop_btn" onclick="stopBatch()">Stop</button>
         </div>
 
-        <div class="grid" id="video_grid"></div>
+        <div class="video-list" id="video_list"></div>
 
         <div class="progress-section">
             <div class="prog-top">
@@ -687,6 +719,39 @@ HTML_TEMPLATE = r"""
 
     <script>
         let videoItems = [];
+
+        function formatSec(sec) {
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        }
+
+        function showZoom(src, e) {
+            if (!src) return;
+            const pop = document.getElementById("hover_zoom");
+            pop.src = src;
+            pop.style.display = "block";
+            moveZoom(e);
+        }
+
+        function moveZoom(e) {
+            const pop = document.getElementById("hover_zoom");
+            if (pop.style.display !== "block") return;
+            const popW = 440, popH = 260;
+            let left = e.clientX + 18;
+            let top = e.clientY - 120;
+            if (left + popW > window.innerWidth) left = e.clientX - popW - 18;
+            if (top < 10) top = 10;
+            if (top + popH > window.innerHeight) top = window.innerHeight - popH - 10;
+            pop.style.left = left + "px";
+            pop.style.top = top + "px";
+        }
+
+        function hideZoom() {
+            const pop = document.getElementById("hover_zoom");
+            pop.style.display = "none";
+            pop.src = "";
+        }
 
         async function loadVideos() {
             const res = await fetch('/api/get_videos');
@@ -703,65 +768,90 @@ HTML_TEMPLATE = r"""
             const existing = new Map(videoItems.map(v => [v.fileName, v]));
             videoItems = data.videos.map(v => {
                 if (existing.has(v.fileName)) {
-                    return { ...existing.get(v.fileName), size: v.size };
+                    return { ...existing.get(v.fileName), size: v.size, thumbs: v.thumbs };
                 }
-                return { fileName: v.fileName, size: v.size, selected: true, caption: "", imageBase64: "", done: false };
+                const defaultThumb = (v.thumbs && v.thumbs.length > 0) ? v.thumbs[0] : "";
+                return {
+                    fileName: v.fileName,
+                    size: v.size,
+                    thumbs: v.thumbs || [],
+                    selected: true,
+                    caption: "",
+                    selectedThumbFile: defaultThumb,
+                    imageBase64: "",
+                    done: false
+                };
             });
 
-            renderGrid();
+            renderList();
         }
 
-        function renderGrid() {
-            const grid = document.getElementById("video_grid");
+        function renderList() {
+            const list = document.getElementById("video_list");
             document.getElementById("vid_count").innerText = `${videoItems.length} Videos Ready`;
             document.getElementById("start_btn").disabled = videoItems.length === 0;
 
             if (videoItems.length === 0) {
-                grid.innerHTML = `<div style="color:#64748b;font-size:12px;padding:30px;text-align:center;grid-column:1/-1;">No edited videos yet. Download via Chrome (VDH) — they will appear here automatically.</div>`;
+                list.innerHTML = `<div style="color:#64748b;font-size:12px;padding:30px;text-align:center;">No edited videos yet. Download via Chrome (VDH) — they will appear here automatically.</div>`;
                 return;
             }
 
-            grid.innerHTML = "";
+            list.innerHTML = "";
             videoItems.forEach((item, idx) => {
-                const hasImg = !!item.imageBase64;
                 const card = document.createElement("div");
                 card.className = "card" + (item.done ? " done" : "");
+
+                let slidesHtml = "";
+                item.thumbs.forEach((tFile, tIdx) => {
+                    const thumbUrl = `/thumb/${encodeURIComponent(item.fileName)}/${tFile}`;
+                    const isActive = (!item.imageBase64 && item.selectedThumbFile === tFile) ? "active" : "";
+                    const secLabel = formatSec((tIdx + 1) * 5);
+                    slidesHtml += `
+                        <div class="slide-item ${isActive}"
+                             onclick="selectSlideThumb(${idx}, '${tFile}')"
+                             onmouseenter="showZoom('${thumbUrl}', event)"
+                             onmousemove="moveZoom(event)"
+                             onmouseleave="hideZoom()">
+                            <img src="${thumbUrl}" loading="lazy">
+                            <span class="time-tag">${secLabel}</span>
+                        </div>
+                    `;
+                });
+
+                const activePreviewSrc = item.imageBase64
+                    ? item.imageBase64
+                    : (item.selectedThumbFile ? `/thumb/${encodeURIComponent(item.fileName)}/${item.selectedThumbFile}` : "");
+
                 card.innerHTML = `
                     <div class="card-head">
-                        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                             <input type="checkbox" ${item.selected ? "checked" : ""} onchange="videoItems[${idx}].selected = this.checked">
-                            <span class="file-title" title="${item.fileName}">${item.fileName}</span>
+                            <span class="file-title">${item.fileName}</span>
                         </label>
-                        <span style="font-size:11px;color:#94a3b8;">${item.size}</span>
+                        <span style="font-size:11.5px;color:#94a3b8;">${item.size}</span>
                     </div>
-                    <div class="player-row">
-                        <video id="vid_${idx}" src="/preview/${encodeURIComponent(item.fileName)}" controls preload="metadata"></video>
-                        <div class="thumb-side">
-                            <div class="thumb-box" tabindex="0" onpaste="handlePaste(${idx}, event)" title="Click and press Ctrl+V to paste image">
-                                <span class="thumb-hint" id="hint_${idx}" style="${hasImg ? 'display:none;' : ''}">Click & Ctrl+V<br>or Capture</span>
-                                <img id="img_${idx}" src="${item.imageBase64}" style="${hasImg ? 'display:block;' : ''}">
-                            </div>
-                            <button class="btn-cap" onclick="captureFrame(${idx})">📸 Capture Frame</button>
+                    <div class="slider-wrap">${slidesHtml || '<span style="font-size:11px;color:#64748b;padding:10px;">Generating 5s thumbnails...</span>'}</div>
+                    <div class="bottom-row">
+                        <div class="selected-preview-box" tabindex="0"
+                             onpaste="handlePaste(${idx}, event)"
+                             onmouseenter="showZoom('${activePreviewSrc}', event)"
+                             onmousemove="moveZoom(event)"
+                             onmouseleave="hideZoom()"
+                             title="Selected Thumbnail (Click & Ctrl+V to paste custom photo)">
+                            <span class="hint-txt" style="${activePreviewSrc ? 'display:none;' : ''}">Click & Ctrl+V</span>
+                            <img src="${activePreviewSrc}" style="${activePreviewSrc ? 'display:block;' : ''}">
                         </div>
+                        <input type="text" class="cap-input" placeholder="Custom caption (Leave empty for default)" value="${item.caption}" oninput="videoItems[${idx}].caption = this.value">
                     </div>
-                    <input type="text" placeholder="Custom caption (Leave empty for default)" value="${item.caption}" oninput="videoItems[${idx}].caption = this.value">
                 `;
-                grid.appendChild(card);
+                list.appendChild(card);
             });
         }
 
-        async function captureFrame(idx) {
-            const vid = document.getElementById(`vid_${idx}`);
-            const item = videoItems[idx];
-            const res = await fetch('/api/capture_frame', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: item.fileName, timestamp: vid.currentTime || 0 })
-            });
-            const data = await res.json();
-            if (data.imageBase64) {
-                setThumb(idx, data.imageBase64);
-            }
+        function selectSlideThumb(idx, tFile) {
+            videoItems[idx].selectedThumbFile = tFile;
+            videoItems[idx].imageBase64 = "";
+            renderList();
         }
 
         function handlePaste(idx, event) {
@@ -769,7 +859,11 @@ HTML_TEMPLATE = r"""
             for (let it of items) {
                 if (it.type.indexOf("image") !== -1) {
                     const reader = new FileReader();
-                    reader.onload = e => setThumb(idx, e.target.result);
+                    reader.onload = e => {
+                        videoItems[idx].imageBase64 = e.target.result;
+                        videoItems[idx].selectedThumbFile = "";
+                        renderList();
+                    };
                     reader.readAsDataURL(it.getAsFile());
                     event.preventDefault();
                     break;
@@ -777,17 +871,10 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        function setThumb(idx, b64) {
-            videoItems[idx].imageBase64 = b64;
-            document.getElementById(`img_${idx}`).src = b64;
-            document.getElementById(`img_${idx}`).style.display = "block";
-            document.getElementById(`hint_${idx}`).style.display = "none";
-        }
-
         function applyBulkCaption() {
             const val = document.getElementById("bulk_caption").value;
             videoItems.forEach(v => v.caption = val);
-            renderGrid();
+            renderList();
         }
 
         async function startBatch() {
@@ -832,7 +919,7 @@ HTML_TEMPLATE = r"""
                         changed = true;
                     }
                 });
-                if (changed) renderGrid();
+                if (changed) renderList();
             }
 
             if (!st.running) {
@@ -841,12 +928,7 @@ HTML_TEMPLATE = r"""
             }
         }, 1000);
 
-        setInterval(() => {
-            if (!document.querySelector("video:not([paused])")) {
-                loadVideos();
-            }
-        }, 4000);
-
+        setInterval(loadVideos, 5000);
         loadVideos();
     </script>
 </body>
