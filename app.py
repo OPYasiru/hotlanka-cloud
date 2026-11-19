@@ -8,7 +8,7 @@ import threading
 import subprocess
 from datetime import datetime, timedelta, timezone
 from PIL import Image
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, send_from_directory, abort
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo
 import cv2
@@ -41,7 +41,7 @@ for d in [DOWNLOADS_FOLDER, VIDEOS_FOLDER, SCRUB_FOLDER, SAVED_THUMBS_FOLDER, TE
 app_flask = Flask(__name__)
 
 progress_state = {
-    "mode": "idle",  # idle | editing | uploading
+    "mode": "idle",
     "msg": "Ready",
     "pct": 0
 }
@@ -52,7 +52,7 @@ meta_lock = threading.Lock()
 processed_downloads = set()
 completed_uploads = []
 
-# ================= PERSISTENT METADATA (THUMBS & CAPTIONS) =================
+# ================= PERSISTENT METADATA =================
 def load_metadata():
     with meta_lock:
         if os.path.exists(META_FILE):
@@ -102,22 +102,25 @@ def get_video_info(video_path):
 
 # ================= SCRUBBING PREVIEW & HD FRAME EXTRACTOR =================
 def generate_scrub_video(hd_path, filename):
-    """Creates a tiny 2MB fast-seek scrubbing file for 0ms lag browser scrubbing"""
+    """Creates browser-compatible yuv420p fast-seek scrubbing file"""
     scrub_path = os.path.join(SCRUB_FOLDER, f"{filename}.mp4")
     if os.path.exists(scrub_path) and os.path.getsize(scrub_path) > 5000:
         return scrub_path
 
-    temp_scrub = os.path.join(TEMP_FOLDER, f"scrub_{filename}.mp4")
+    temp_scrub = os.path.join(TEMP_FOLDER, f"scrub_{int(time.time()*1000)}_{filename}.mp4")
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", hd_path,
-        "-vf", "fps=2,scale='min(480,iw)':-2",
-        "-c:v", "libx264", "-g", "1", "-crf", "28", "-preset", "ultrafast",
+        "-vf", "fps=2,scale='min(480,iw)':-2,format=yuv420p",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-g", "1", "-crf", "28", "-preset", "ultrafast",
         "-an", "-movflags", "+faststart",
         temp_scrub
     ]
     subprocess.run(cmd, check=True)
-    if os.path.exists(temp_scrub):
+    if os.path.exists(temp_scrub) and os.path.getsize(temp_scrub) > 3000:
+        if os.path.exists(scrub_path):
+            os.remove(scrub_path)
         os.rename(temp_scrub, scrub_path)
     return scrub_path
 
@@ -189,7 +192,7 @@ def process_downloaded_video(raw_path):
         if crop_filter:
             cmd.extend(["-vf", crop_filter])
         cmd.extend([
-            "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "veryfast",
             "-movflags", "+faststart", "-c:a", "copy", temp_out
         ])
 
@@ -208,19 +211,20 @@ def process_downloaded_video(raw_path):
         proc.wait()
 
         if os.path.exists(temp_out) and os.path.getsize(temp_out) > 10240:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            os.rename(temp_out, out_path)
-
             if progress_state["mode"] != "uploading":
                 progress_state["msg"] = f"Editing: '{filename}' (92%)"
                 progress_state["pct"] = 92
 
-            generate_scrub_video(out_path, filename)
-            _, _, dur, aspect = get_video_info(out_path)
+            # Generate scrub video and default HD thumb BEFORE publishing to VIDEOS_FOLDER
+            generate_scrub_video(temp_out, filename)
+            _, _, dur, aspect = get_video_info(temp_out)
             default_seek = min(3.0, dur / 2.0) if dur > 0 else 1.0
-            thumb_name = extract_hd_frame_at(out_path, filename, default_seek)
+            thumb_name = extract_hd_frame_at(temp_out, filename, default_seek)
             update_video_meta(filename, aspect=aspect, duration=dur, thumbFile=thumb_name or "", caption="")
+
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            os.rename(temp_out, out_path)
 
             if os.path.exists(raw_path):
                 os.remove(raw_path)
@@ -228,7 +232,7 @@ def process_downloaded_video(raw_path):
             if progress_state["mode"] != "uploading":
                 progress_state["msg"] = f"Editing: '{filename}' (100%)"
                 progress_state["pct"] = 100
-                time.sleep(0.8)
+                time.sleep(0.5)
     except Exception:
         if os.path.exists(temp_out):
             os.remove(temp_out)
@@ -449,6 +453,16 @@ def index():
 
 @app_flask.route('/scrub/<path:filename>')
 def serve_scrub(filename):
+    scrub_p = os.path.join(SCRUB_FOLDER, f"{filename}.mp4")
+    if not os.path.exists(scrub_p) or os.path.getsize(scrub_p) < 3000:
+        hd_p = os.path.join(VIDEOS_FOLDER, filename)
+        if os.path.exists(hd_p):
+            try:
+                generate_scrub_video(hd_p, filename)
+            except Exception:
+                abort(404)
+        else:
+            abort(404)
     return send_from_directory(SCRUB_FOLDER, f"{filename}.mp4")
 
 @app_flask.route('/saved_thumb/<path:filename>')
@@ -471,13 +485,12 @@ def get_videos():
             size_mb = f"{os.path.getsize(full_p) / (1024 * 1024):.1f} MB"
             entry = meta.get(f, {})
 
-            # Auto-generate scrub preview & initial thumb for pre-existing videos
             scrub_p = os.path.join(SCRUB_FOLDER, f"{f}.mp4")
-            if not os.path.exists(scrub_p):
+            if not os.path.exists(scrub_p) or os.path.getsize(scrub_p) < 3000:
                 try:
                     generate_scrub_video(full_p, f)
                 except Exception:
-                    pass
+                    continue
 
             thumb_p = os.path.join(SAVED_THUMBS_FOLDER, f"{f}.jpg")
             if not os.path.exists(thumb_p):
@@ -601,7 +614,6 @@ HTML_TEMPLATE = r"""
             overflow: hidden;
         }
 
-        /* TOP HEADER & REAL-TIME SIMPLE PROGRESS BAR */
         .top-header {
             background: #0f0b1f;
             border-bottom: 1px solid #24164a;
@@ -617,364 +629,119 @@ HTML_TEMPLATE = r"""
             justify-content: space-between;
             gap: 16px;
         }
-        .brand {
-            font-size: 16px;
-            font-weight: 700;
-            color: #fff;
-            white-space: nowrap;
-        }
-        .progress-wrap {
-            flex: 1;
-            max-width: 480px;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
+        .brand { font-size: 16px; font-weight: 700; color: #fff; white-space: nowrap; }
+        .progress-wrap { flex: 1; max-width: 480px; display: flex; flex-direction: column; gap: 5px; }
         .prog-text {
-            font-size: 12px;
-            font-weight: 500;
-            color: #cbd5e1;
-            text-align: center;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            font-size: 12px; font-weight: 500; color: #cbd5e1;
+            text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
-        .prog-track {
-            width: 100%;
-            height: 6px;
-            background: #1b1236;
-            border-radius: 6px;
-            overflow: hidden;
-        }
-        .prog-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #8b5cf6, #22c55e);
-            transition: width 0.25s ease;
-        }
-        .sys-actions {
-            display: flex;
-            gap: 8px;
-        }
+        .prog-track { width: 100%; height: 6px; background: #1b1236; border-radius: 6px; overflow: hidden; }
+        .prog-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #8b5cf6, #22c55e); transition: width 0.25s ease; }
+        .sys-actions { display: flex; gap: 8px; }
 
-        .header-row-2 {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
+        .header-row-2 { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
         .count-pill {
-            font-size: 12px;
-            font-weight: 600;
-            color: #c084fc;
-            background: rgba(139, 92, 246, 0.14);
-            border: 1px solid rgba(139, 92, 246, 0.35);
-            padding: 5px 12px;
-            border-radius: 20px;
+            font-size: 12px; font-weight: 600; color: #c084fc;
+            background: rgba(139, 92, 246, 0.14); border: 1px solid rgba(139, 92, 246, 0.35);
+            padding: 5px 12px; border-radius: 20px;
         }
-        .schedule-controls {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
+        .schedule-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
         input[type="text"], input[type="date"] {
-            background: #080612;
-            border: 1px solid #2b1c54;
-            border-radius: 7px;
-            padding: 6px 10px;
-            color: #f8fafc;
-            font-size: 12.5px;
-            outline: none;
+            background: #080612; border: 1px solid #2b1c54; border-radius: 7px;
+            padding: 6px 10px; color: #f8fafc; font-size: 12.5px; outline: none;
         }
         input:focus { border-color: #8b5cf6; }
 
-        /* 24-Hour Time Selector Pill (from original script) */
         .time-selector {
-            position: relative;
-            display: inline-flex;
-            align-items: center;
-            background: #080612;
-            border: 1px solid #2b1c54;
-            border-radius: 7px;
-            padding: 5px 10px;
-            gap: 6px;
-            cursor: pointer;
-            font-size: 12.5px;
+            position: relative; display: inline-flex; align-items: center;
+            background: #080612; border: 1px solid #2b1c54; border-radius: 7px;
+            padding: 5px 10px; gap: 6px; cursor: pointer; font-size: 12.5px;
         }
         .time-popup {
-            display: none;
-            position: absolute;
-            top: 115%;
-            right: 0;
-            background: #130d29;
-            border: 1px solid #4c2f8a;
-            border-radius: 9px;
-            padding: 8px;
-            z-index: 500;
-            box-shadow: 0 12px 30px rgba(0,0,0,0.85);
-            gap: 6px;
+            display: none; position: absolute; top: 115%; right: 0;
+            background: #130d29; border: 1px solid #4c2f8a; border-radius: 9px;
+            padding: 8px; z-index: 500; box-shadow: 0 12px 30px rgba(0,0,0,0.85); gap: 6px;
         }
         .time-popup.open { display: flex; }
-        .time-col {
-            max-height: 150px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-            padding-right: 4px;
-        }
-        .time-opt {
-            padding: 4px 10px;
-            border-radius: 5px;
-            font-size: 12px;
-            cursor: pointer;
-            text-align: center;
-        }
+        .time-col { max-height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; padding-right: 4px; }
+        .time-opt { padding: 4px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-align: center; }
         .time-opt:hover, .time-opt.active { background: #7c3aed; color: #fff; }
 
         .btn {
-            background: #1b1236;
-            border: 1px solid #38246b;
-            color: #e9d5ff;
-            padding: 6px 12px;
-            border-radius: 7px;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            white-space: nowrap;
+            background: #1b1236; border: 1px solid #38246b; color: #e9d5ff;
+            padding: 6px 12px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
         }
         .btn:hover { background: #291b52; }
-        .btn-primary {
-            background: linear-gradient(135deg, #8b5cf6, #7c3aed);
-            border: none;
-            color: #fff;
-            padding: 7px 16px;
-        }
+        .btn-primary { background: linear-gradient(135deg, #8b5cf6, #7c3aed); border: none; color: #fff; padding: 7px 16px; }
         .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
-        .btn-stop-server {
-            background: rgba(239, 68, 68, 0.14);
-            border: 1px solid rgba(239, 68, 68, 0.45);
-            color: #fca5a5;
-        }
+        .btn-stop-server { background: rgba(239, 68, 68, 0.14); border: 1px solid rgba(239, 68, 68, 0.45); color: #fca5a5; }
         .btn-stop-server:hover { background: #dc2626; color: #fff; }
         .btn-danger { background: #ef4444; border: none; color: #fff; display: none; }
 
-        /* MAIN 65:35 SPLIT WORKSPACE */
-        .workspace {
-            flex: 1;
-            display: flex;
-            gap: 14px;
-            padding: 14px 18px;
-            overflow: hidden;
-        }
-
-        /* LEFT: 65% VIDEO LIST */
-        .left-list {
-            flex: 0 0 65%;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            padding-right: 6px;
-        }
+        .workspace { flex: 1; display: flex; gap: 14px; padding: 14px 18px; overflow: hidden; }
+        .left-list { flex: 0 0 65%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 6px; }
         .left-list::-webkit-scrollbar { width: 6px; }
         .left-list::-webkit-scrollbar-thumb { background: #311f61; border-radius: 6px; }
 
         .v-card {
-            background: #0f0b1f;
-            border: 1px solid #221545;
-            border-radius: 11px;
-            padding: 10px 12px;
-            display: flex;
-            gap: 12px;
-            align-items: center;
-            cursor: pointer;
+            background: #0f0b1f; border: 1px solid #221545; border-radius: 11px;
+            padding: 10px 12px; display: flex; gap: 12px; align-items: center; cursor: pointer;
             transition: border-color 0.15s, background 0.15s;
         }
         .v-card:hover { border-color: #4c2f8a; }
-        .v-card.active {
-            border-color: #8b5cf6;
-            background: #150f2b;
-        }
+        .v-card.active { border-color: #8b5cf6; background: #150f2b; }
 
         .thumb-box {
-            width: 78px;
-            height: 112px;
-            border-radius: 8px;
-            background: #080612;
-            border: 1px dashed #43297a;
-            flex-shrink: 0;
-            position: relative;
-            overflow: hidden;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            width: 78px; height: 112px; border-radius: 8px; background: #080612;
+            border: 1px dashed #43297a; flex-shrink: 0; position: relative; overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
         }
-        .thumb-box.landscape {
-            width: 128px;
-            height: 76px;
-        }
-        .thumb-box img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
+        .thumb-box.landscape { width: 128px; height: 76px; }
+        .thumb-box img { width: 100%; height: 100%; object-fit: cover; }
         .thumb-hint {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0, 0, 0, 0.72);
-            font-size: 9px;
-            color: #cbd5e1;
-            text-align: center;
-            padding: 2px;
+            position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0, 0, 0, 0.72);
+            font-size: 9px; color: #cbd5e1; text-align: center; padding: 2px;
         }
 
-        .card-info {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            min-width: 0;
-        }
-        .card-top-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 8px;
-        }
-        .v-name {
-            font-size: 13.5px;
-            font-weight: 600;
-            color: #f8fafc;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .v-meta {
-            font-size: 11px;
-            color: #94a3b8;
-        }
-        .card-actions {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-shrink: 0;
-        }
-        .card-actions input[type="checkbox"] {
-            width: 16px;
-            height: 16px;
-            accent-color: #8b5cf6;
-            cursor: pointer;
-        }
+        .card-info { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+        .card-top-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        .v-name { font-size: 13.5px; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .v-meta { font-size: 11px; color: #94a3b8; }
+        .card-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+        .card-actions input[type="checkbox"] { width: 16px; height: 16px; accent-color: #8b5cf6; cursor: pointer; }
         .del-btn {
-            background: transparent;
-            border: 1px solid rgba(239, 68, 68, 0.35);
-            color: #f87171;
-            padding: 3px 8px;
-            border-radius: 6px;
-            font-size: 11px;
-            cursor: pointer;
+            background: transparent; border: 1px solid rgba(239, 68, 68, 0.35); color: #f87171;
+            padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer;
         }
         .del-btn:hover { background: #ef4444; color: #fff; }
+        .cap-label { font-size: 11px; color: #94a3b8; }
+        .cap-box { width: 100%; background: #080612; border: 1px solid #26184f; border-radius: 7px; padding: 7px 10px; color: #f1f5f9; font-size: 12.5px; }
 
-        .cap-label {
-            font-size: 11px;
-            color: #94a3b8;
-        }
-        .cap-box {
-            width: 100%;
-            background: #080612;
-            border: 1px solid #26184f;
-            border-radius: 7px;
-            padding: 7px 10px;
-            color: #f1f5f9;
-            font-size: 12.5px;
-        }
-
-        /* RIGHT: 35% PREVIEW PLAYER */
         .right-player {
-            flex: 1;
-            background: #0f0b1f;
-            border: 1px solid #221545;
-            border-radius: 12px;
-            padding: 12px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            gap: 10px;
+            flex: 1; background: #0f0b1f; border: 1px solid #221545; border-radius: 12px;
+            padding: 12px; display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
         }
-        .player-title {
-            font-size: 13px;
-            font-weight: 600;
-            color: #e2e8f0;
-            display: flex;
-            justify-content: space-between;
-        }
+        .player-title { font-size: 13px; font-weight: 600; color: #e2e8f0; display: flex; justify-content: space-between; }
         .video-stage {
-            flex: 1;
-            background: #05040a;
-            border-radius: 9px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-            position: relative;
+            flex: 1; background: #05040a; border-radius: 9px;
+            display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;
         }
-        .video-stage video {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-        }
-        .seek-controls {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        .seek-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 11.5px;
-            color: #94a3b8;
-            font-family: monospace;
-        }
-        .seek-slider {
-            flex: 1;
-            accent-color: #8b5cf6;
-            cursor: pointer;
-        }
+        .video-stage video { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .seek-controls { display: flex; flex-direction: column; gap: 8px; }
+        .seek-row { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: #94a3b8; font-family: monospace; }
+        .seek-slider { flex: 1; accent-color: #8b5cf6; cursor: pointer; }
         .btn-capture {
-            width: 100%;
-            background: linear-gradient(135deg, #8b5cf6, #6d28d9);
-            border: none;
-            color: #fff;
-            padding: 9px;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
+            width: 100%; background: linear-gradient(135deg, #8b5cf6, #6d28d9); border: none; color: #fff;
+            padding: 9px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer;
         }
         .btn-capture:hover { opacity: 0.92; }
         .btn-capture:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        /* HOVER ZOOM POPUP */
         .hover-zoom {
-            position: fixed;
-            pointer-events: none;
-            z-index: 9999;
-            background: #0f0b1f;
-            border: 2px solid #8b5cf6;
-            border-radius: 10px;
-            box-shadow: 0 18px 40px rgba(0,0,0,0.92);
-            max-width: 360px;
-            max-height: 440px;
-            object-fit: contain;
-            display: none;
+            position: fixed; pointer-events: none; z-index: 9999; background: #0f0b1f;
+            border: 2px solid #8b5cf6; border-radius: 10px; box-shadow: 0 18px 40px rgba(0,0,0,0.92);
+            max-width: 360px; max-height: 440px; object-fit: contain; display: none;
         }
 
         @media (max-width: 820px) {
@@ -1059,7 +826,6 @@ HTML_TEMPLATE = r"""
         let blobCache = {};
         let captionTimers = {};
 
-        // Build 24h Time Picker
         (function initTimePicker() {
             const hCol = document.getElementById("hour_col");
             const mCol = document.getElementById("min_col");
@@ -1108,7 +874,6 @@ HTML_TEMPLATE = r"""
             await fetch('/api/shutdown_server', { method: 'POST' });
         }
 
-        // Hover Zoom
         function showZoom(src, e) {
             if (!src) return;
             const z = document.getElementById("hover_zoom");
@@ -1128,11 +893,9 @@ HTML_TEMPLATE = r"""
             z.style.top = top + "px";
         }
         function hideZoom() {
-            const z = document.getElementById("hover_zoom");
-            z.style.display = "none";
+            document.getElementById("hover_zoom").style.display = "none";
         }
 
-        // Local-like 0ms Lag Scrubbing Player
         const player = document.getElementById("scrub_player");
         const slider = document.getElementById("seek_slider");
 
@@ -1180,12 +943,22 @@ HTML_TEMPLATE = r"""
             });
 
             if (!blobCache[fileName]) {
-                const resp = await fetch(`/scrub/${encodeURIComponent(fileName)}`);
-                const blob = await resp.blob();
-                blobCache[fileName] = URL.createObjectURL(blob);
+                try {
+                    const resp = await fetch(`/scrub/${encodeURIComponent(fileName)}`);
+                    if (resp.ok) {
+                        const blob = await resp.blob();
+                        if (blob.size > 3000) {
+                            blobCache[fileName] = URL.createObjectURL(blob);
+                        }
+                    }
+                } catch (e) {}
             }
-            player.src = blobCache[fileName];
-            player.currentTime = 0;
+
+            if (blobCache[fileName]) {
+                player.src = blobCache[fileName];
+                player.load();
+                player.currentTime = 0;
+            }
         }
 
         async function captureCurrentFrame() {
@@ -1257,6 +1030,7 @@ HTML_TEMPLATE = r"""
                 body: JSON.stringify({ fileName })
             });
             videos = videos.filter(v => v.fileName !== fileName);
+            delete blobCache[fileName];
             const card = document.querySelector(`.v-card[data-file="${CSS.escape(fileName)}"]`);
             if (card) card.remove();
             updateCountBadge();
@@ -1332,13 +1106,11 @@ HTML_TEMPLATE = r"""
             if (v) v.selected = checked;
         }
 
-        // Seamless Live Sync (No page reload, preserves active scrubbing player)
         async function syncDashboard() {
             try {
                 const res = await fetch('/api/get_videos');
                 const data = await res.json();
 
-                // Update top progress bar
                 if (data.progress) {
                     document.getElementById("prog_text").innerText = data.progress.msg;
                     document.getElementById("prog_fill").style.width = data.progress.pct + "%";
@@ -1352,7 +1124,6 @@ HTML_TEMPLATE = r"""
                 const listEl = document.getElementById("video_list");
                 const serverNames = new Set(data.videos.map(x => x.fileName));
 
-                // Remove deleted/uploaded videos smoothly
                 videos = videos.filter(v => {
                     if (!serverNames.has(v.fileName)) {
                         const el = document.querySelector(`.v-card[data-file="${CSS.escape(v.fileName)}"]`);
@@ -1362,7 +1133,6 @@ HTML_TEMPLATE = r"""
                     return true;
                 });
 
-                // Append newly edited videos smoothly
                 const localNames = new Set(videos.map(x => x.fileName));
                 data.videos.forEach(sv => {
                     if (!localNames.has(sv.fileName)) {
