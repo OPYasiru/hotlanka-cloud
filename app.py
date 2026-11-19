@@ -1,7 +1,7 @@
 import os
 import re
+import json
 import time
-import glob
 import base64
 import asyncio
 import threading
@@ -21,59 +21,125 @@ API_HASH = "b1d1c146f1ec4d51fbae1ca15acd51e7"
 BASE_DIR = os.path.expanduser("~")
 DOWNLOADS_FOLDER = os.path.join(BASE_DIR, "Downloads")
 VIDEOS_FOLDER = os.path.join(BASE_DIR, "Edited")
-THUMBS_FOLDER = os.path.join(VIDEOS_FOLDER, "thumbs_5s")
+SCRUB_FOLDER = os.path.join(VIDEOS_FOLDER, "scrub_previews")
+SAVED_THUMBS_FOLDER = os.path.join(VIDEOS_FOLDER, "saved_thumbs")
 TEMP_FOLDER = os.path.join(VIDEOS_FOLDER, "temp")
+META_FILE = os.path.join(VIDEOS_FOLDER, "metadata.json")
 SESSION_PATH = os.path.join(BASE_DIR, "telethon_cloud_session")
 
 FILE_STORE_BOT = "LankaFile_bot"
 POST_BOT = "HotLanka_Bot"
 DEFAULT_CAPTION = "🔥Hot Lanka Exclusive 🔥"
 INTRO_SKIP_SECONDS = 8.5
-THUMB_INTERVAL_SEC = 5  # Extract 1 HD frame every 5 seconds
 
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 # =================================================
 
-for d in [DOWNLOADS_FOLDER, VIDEOS_FOLDER, THUMBS_FOLDER, TEMP_FOLDER]:
+for d in [DOWNLOADS_FOLDER, VIDEOS_FOLDER, SCRUB_FOLDER, SAVED_THUMBS_FOLDER, TEMP_FOLDER]:
     os.makedirs(d, exist_ok=True)
 
 app_flask = Flask(__name__)
 
-editor_state = {"active": False, "file": "", "step": "Idle"}
-batch_state = {
-    "running": False,
-    "done": False,
+progress_state = {
+    "mode": "idle",  # idle | editing | uploading
     "msg": "Ready",
-    "pct": 0,
-    "current_file": None,
-    "completed_files": [],
-    "logs": []
+    "pct": 0
 }
+
 stop_flag = False
 batch_lock = threading.Lock()
+meta_lock = threading.Lock()
 processed_downloads = set()
+completed_uploads = []
 
-def add_log(text):
-    now_str = datetime.now(SL_TZ).strftime("%H:%M:%S")
-    batch_state["logs"].append(f"[{now_str}] {text}")
-    if len(batch_state["logs"]) > 40:
-        batch_state["logs"].pop(0)
-
-def clean_temp_folder():
-    for f in os.listdir(TEMP_FOLDER):
-        fp = os.path.join(TEMP_FOLDER, f)
-        if os.path.isfile(fp):
+# ================= PERSISTENT METADATA (THUMBS & CAPTIONS) =================
+def load_metadata():
+    with meta_lock:
+        if os.path.exists(META_FILE):
             try:
-                os.remove(fp)
+                with open(META_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
             except Exception:
                 pass
+        return {}
 
-def get_video_thumb_dir(filename):
-    safe_dir = os.path.join(THUMBS_FOLDER, filename)
-    os.makedirs(safe_dir, exist_ok=True)
-    return safe_dir
+def save_metadata(data):
+    with meta_lock:
+        try:
+            with open(META_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
-# ================= AUTO VIDEO EDITOR & 5-SEC HD THUMB GENERATOR =================
+def update_video_meta(filename, **kwargs):
+    data = load_metadata()
+    entry = data.get(filename, {})
+    entry.update(kwargs)
+    data[filename] = entry
+    save_metadata(data)
+
+def delete_video_meta(filename):
+    data = load_metadata()
+    if filename in data:
+        del data[filename]
+        save_metadata(data)
+
+def get_video_info(video_path):
+    w, h, dur = 720, 1280, 0.0
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 720)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1280)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            dur = round(frames / fps, 2) if fps > 0 else 0.0
+            cap.release()
+    except Exception:
+        pass
+    aspect = "9:16" if h >= w else "16:9"
+    return w, h, dur, aspect
+
+# ================= SCRUBBING PREVIEW & HD FRAME EXTRACTOR =================
+def generate_scrub_video(hd_path, filename):
+    """Creates a tiny 2MB fast-seek scrubbing file for 0ms lag browser scrubbing"""
+    scrub_path = os.path.join(SCRUB_FOLDER, f"{filename}.mp4")
+    if os.path.exists(scrub_path) and os.path.getsize(scrub_path) > 5000:
+        return scrub_path
+
+    temp_scrub = os.path.join(TEMP_FOLDER, f"scrub_{filename}.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", hd_path,
+        "-vf", "fps=2,scale='min(480,iw)':-2",
+        "-c:v", "libx264", "-g", "1", "-crf", "28", "-preset", "ultrafast",
+        "-an", "-movflags", "+faststart",
+        temp_scrub
+    ]
+    subprocess.run(cmd, check=True)
+    if os.path.exists(temp_scrub):
+        os.rename(temp_scrub, scrub_path)
+    return scrub_path
+
+def extract_hd_frame_at(hd_path, filename, timestamp_sec):
+    """Captures 100% Original Full-HD frame at exact timestamp & saves permanently"""
+    thumb_name = f"{filename}.jpg"
+    thumb_path = os.path.join(SAVED_THUMBS_FOLDER, thumb_name)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, float(timestamp_sec)):.2f}",
+        "-i", hd_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        thumb_path
+    ]
+    subprocess.run(cmd, check=True)
+    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1000:
+        update_video_meta(filename, thumbFile=thumb_name, thumbUpdated=time.time())
+        return thumb_name
+    return None
+
+# ================= AUTO VIDEO EDITOR WITH % PROGRESS =================
 def detect_black_bars_and_crop(video_path, check_sec=9):
     try:
         cap = cv2.VideoCapture(video_path)
@@ -81,14 +147,12 @@ def detect_black_bars_and_crop(video_path, check_sec=9):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fps * check_sec))
         ret, frame = cap.read()
         cap.release()
-
         if not ret or frame is None:
             return None
 
         h, w, _ = frame.shape
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         col_means = np.mean(gray, axis=0)
-
         left_bar = next((i for i in range(w // 2) if col_means[i] > 18), 0)
         right_bar = next((i + 1 for i in range(w - 1, w // 2, -1) if col_means[i] > 18), w)
         crop_w = right_bar - left_bar
@@ -102,61 +166,77 @@ def detect_black_bars_and_crop(video_path, check_sec=9):
         pass
     return None
 
-def generate_5sec_hd_thumbs(video_path, filename):
-    """Extract crisp HD JPEG frames every 5 seconds from the edited video"""
-    t_dir = get_video_thumb_dir(filename)
-    for old in os.listdir(t_dir):
-        try:
-            os.remove(os.path.join(t_dir, old))
-        except Exception:
-            pass
-
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", video_path,
-        "-vf", f"fps=1/{THUMB_INTERVAL_SEC},scale='min(960,iw)':-2",
-        "-q:v", "2",
-        os.path.join(t_dir, "frame_%04d.jpg")
-    ]
-    subprocess.run(cmd, check=True)
-
 def process_downloaded_video(raw_path):
     filename = os.path.basename(raw_path)
     out_path = os.path.join(VIDEOS_FOLDER, filename)
     temp_out = os.path.join(TEMP_FOLDER, f"edit_{filename}")
 
-    editor_state["active"] = True
-    editor_state["file"] = filename
-    editor_state["step"] = "Trimming 8.5s & Cropping..."
-    add_log(f"Auto-editing started: {filename}")
+    _, _, raw_dur, _ = get_video_info(raw_path)
+    target_dur = max(1.0, raw_dur - INTRO_SKIP_SECONDS)
+
+    if progress_state["mode"] != "uploading":
+        progress_state["mode"] = "editing"
+        progress_state["msg"] = f"Editing: '{filename}' (5%)"
+        progress_state["pct"] = 5
 
     try:
         crop_filter = detect_black_bars_and_crop(raw_path, check_sec=9)
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", str(INTRO_SKIP_SECONDS), "-i", raw_path]
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-progress", "pipe:1",
+            "-ss", str(INTRO_SKIP_SECONDS), "-i", raw_path
+        ]
         if crop_filter:
             cmd.extend(["-vf", crop_filter])
-        cmd.extend(["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-movflags", "+faststart", "-c:a", "copy", temp_out])
-        subprocess.run(cmd, check=True)
+        cmd.extend([
+            "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+            "-movflags", "+faststart", "-c:a", "copy", temp_out
+        ])
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in proc.stdout:
+            if line.startswith("out_time_us="):
+                try:
+                    us = int(line.split("=")[1].strip())
+                    sec_done = us / 1_000_000.0
+                    pct = min(85, max(5, int((sec_done / target_dur) * 85)))
+                    if progress_state["mode"] != "uploading":
+                        progress_state["msg"] = f"Editing: '{filename}' ({pct}%)"
+                        progress_state["pct"] = pct
+                except Exception:
+                    pass
+        proc.wait()
 
         if os.path.exists(temp_out) and os.path.getsize(temp_out) > 10240:
             if os.path.exists(out_path):
                 os.remove(out_path)
             os.rename(temp_out, out_path)
 
-            editor_state["step"] = "Extracting 5s HD Thumbnails..."
-            generate_5sec_hd_thumbs(out_path, filename)
+            if progress_state["mode"] != "uploading":
+                progress_state["msg"] = f"Editing: '{filename}' (92%)"
+                progress_state["pct"] = 92
+
+            generate_scrub_video(out_path, filename)
+            _, _, dur, aspect = get_video_info(out_path)
+            default_seek = min(3.0, dur / 2.0) if dur > 0 else 1.0
+            thumb_name = extract_hd_frame_at(out_path, filename, default_seek)
+            update_video_meta(filename, aspect=aspect, duration=dur, thumbFile=thumb_name or "", caption="")
 
             if os.path.exists(raw_path):
                 os.remove(raw_path)
-            add_log(f"Ready for upload: {filename}")
-    except Exception as e:
-        add_log(f"Edit error ({filename}): {e}")
+
+            if progress_state["mode"] != "uploading":
+                progress_state["msg"] = f"Editing: '{filename}' (100%)"
+                progress_state["pct"] = 100
+                time.sleep(0.8)
+    except Exception:
         if os.path.exists(temp_out):
             os.remove(temp_out)
     finally:
-        editor_state["active"] = False
-        editor_state["file"] = ""
-        editor_state["step"] = "Idle"
+        if progress_state["mode"] == "editing":
+            progress_state["mode"] = "idle"
+            progress_state["msg"] = "Ready"
+            progress_state["pct"] = 0
 
 def background_download_watcher():
     valid_exts = ('.mp4', '.mkv', '.mov', '.webm', '.avi')
@@ -231,6 +311,19 @@ def calculate_schedule_datetime(date_str, time_str):
     except Exception:
         return None
 
+def cleanup_video_files(f_name):
+    for p in [
+        os.path.join(VIDEOS_FOLDER, f_name),
+        os.path.join(SCRUB_FOLDER, f"{f_name}.mp4"),
+        os.path.join(SAVED_THUMBS_FOLDER, f"{f_name}.jpg")
+    ]:
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    delete_video_meta(f_name)
+
 def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
     global stop_flag
     if not batch_lock.acquire(blocking=False):
@@ -238,61 +331,37 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
 
     try:
         stop_flag = False
-        batch_state["running"] = True
-        batch_state["done"] = False
-        batch_state["completed_files"] = []
+        progress_state["mode"] = "uploading"
+        progress_state["msg"] = "Connecting to Telegram..."
+        progress_state["pct"] = 2
 
         async def worker():
             global stop_flag
-            batch_state["msg"] = "Connecting to Telegram..."
             client = TelegramClient(SESSION_PATH, API_ID, API_HASH, connection_retries=5)
             await client.connect()
 
             if not await client.is_user_authorized():
-                batch_state["msg"] = "Error: Telegram not logged in! Run login in terminal."
-                batch_state["done"] = True
-                batch_state["running"] = False
-                add_log("Error: Telegram session not authorized.")
+                progress_state["msg"] = "Error: Telegram not logged in!"
+                progress_state["mode"] = "idle"
                 return
 
             total = len(tasks)
             base_schedule_dt = calculate_schedule_datetime(schedule_date_str, schedule_time_str)
-            add_log(f"Batch started: {total} videos.")
 
             for idx, item in enumerate(tasks, start=1):
                 if stop_flag:
-                    batch_state["msg"] = "Stopped by user"
-                    add_log("Batch stopped by user.")
+                    progress_state["msg"] = "Stopped by user"
                     break
 
                 f_name = item['fileName']
                 caption = item.get('caption', '').strip() or DEFAULT_CAPTION
-                selected_thumb_file = item.get('selectedThumbFile', '')
-                image_b64 = item.get('imageBase64', '')
                 file_path = os.path.join(VIDEOS_FOLDER, f_name)
 
                 if not os.path.exists(file_path):
                     continue
 
-                batch_state["current_file"] = f_name
-                batch_state["msg"] = f"[{idx}/{total}] Step 1/4: Preparing..."
-                batch_state["pct"] = 5
-
-                post_photo_custom = None
-                if image_b64 and "," in image_b64:
-                    try:
-                        post_photo_custom = os.path.join(TEMP_FOLDER, f"paste_{idx}_{int(time.time())}.jpg")
-                        img_bytes = base64.b64decode(image_b64.split(",")[1])
-                        with open(post_photo_custom, "wb") as f_img:
-                            f_img.write(img_bytes)
-                        with Image.open(post_photo_custom) as im:
-                            im.convert('RGB').save(post_photo_custom, quality=95)
-                    except Exception:
-                        post_photo_custom = None
-                elif selected_thumb_file:
-                    cand = os.path.join(get_video_thumb_dir(f_name), selected_thumb_file)
-                    if os.path.exists(cand):
-                        post_photo_custom = cand
+                saved_thumb_path = os.path.join(SAVED_THUMBS_FOLDER, f"{f_name}.jpg")
+                post_photo_custom = saved_thumb_path if os.path.exists(saved_thumb_path) else None
 
                 duration, width, height, auto_thumb = extract_video_metadata_and_thumb(file_path, idx)
 
@@ -306,15 +375,12 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                 except Exception:
                     pass
 
-                start_t = time.time()
                 def progress_callback(cur, tot):
                     if stop_flag:
                         return
-                    elapsed = max(time.time() - start_t, 0.1)
-                    speed_mb = (cur / (1024 * 1024)) / elapsed
-                    pct = int((cur / tot) * 80)
-                    batch_state["pct"] = pct
-                    batch_state["msg"] = f"[{idx}/{total}] Step 2/4: Uploading... ({speed_mb:.1f} MB/s)"
+                    pct = int((cur / tot) * 85)
+                    progress_state["pct"] = pct
+                    progress_state["msg"] = f"Uploading [{idx}/{total}]: '{f_name}' ({pct}%)"
 
                 uploaded_file = await client.upload_file(
                     file_path,
@@ -333,8 +399,8 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                     attributes=[DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)]
                 )
 
-                batch_state["msg"] = f"[{idx}/{total}] Step 3/4: Fetching Link..."
-                batch_state["pct"] = 88
+                progress_state["msg"] = f"Uploading [{idx}/{total}]: '{f_name}' (90%)"
+                progress_state["pct"] = 90
                 extracted_link = await get_fresh_link_telethon(client, last_bot_msg_id, wait_seconds=35)
 
                 if extracted_link and not stop_flag:
@@ -342,8 +408,8 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                     if base_schedule_dt:
                         current_item_schedule = base_schedule_dt + timedelta(seconds=(idx - 1) * 2)
 
-                    batch_state["msg"] = f"[{idx}/{total}] Step 4/4: Scheduling Post..."
-                    batch_state["pct"] = 96
+                    progress_state["msg"] = f"Uploading [{idx}/{total}]: '{f_name}' (96%)"
+                    progress_state["pct"] = 96
                     post_payload = f"{caption}\n\n{extracted_link}"
 
                     if post_photo_custom and os.path.exists(post_photo_custom):
@@ -351,38 +417,20 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
                     else:
                         await client.send_message(POST_BOT, message=post_payload, schedule=current_item_schedule)
 
-                    # Clean up video + 5s thumbnails folder
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                    t_dir = get_video_thumb_dir(f_name)
-                    for tf in os.listdir(t_dir):
-                        try:
-                            os.remove(os.path.join(t_dir, tf))
-                        except Exception:
-                            pass
-                    try:
-                        os.rmdir(t_dir)
-                    except Exception:
-                        pass
+                    cleanup_video_files(f_name)
                     if auto_thumb and os.path.exists(auto_thumb):
                         os.remove(auto_thumb)
 
-                    batch_state["completed_files"].append(f_name)
-                    batch_state["pct"] = 100
-                    add_log(f"[{idx}/{total}] Done: {f_name} -> Scheduled!")
-                else:
-                    add_log(f"[{idx}/{total}] Failed to get link for {f_name}")
+                    completed_uploads.append(f_name)
+                    progress_state["pct"] = 100
+                    progress_state["msg"] = f"Uploading [{idx}/{total}]: '{f_name}' (100%)"
 
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)
 
             await client.disconnect()
-            clean_temp_folder()
-            batch_state["current_file"] = None
-            batch_state["running"] = False
-            batch_state["done"] = True
-            if not stop_flag:
-                batch_state["msg"] = "All Tasks Completed!"
-                add_log("Batch finished successfully.")
+            progress_state["mode"] = "idle"
+            progress_state["pct"] = 0
+            progress_state["msg"] = "All Tasks Completed!" if not stop_flag else "Stopped"
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -391,7 +439,7 @@ def run_uploader_thread(tasks, schedule_date_str, schedule_time_str):
     finally:
         batch_lock.release()
 
-# ================= FLASK ROUTES =================
+# ================= FLASK API ROUTES =================
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
@@ -399,14 +447,20 @@ def natural_sort_key(s):
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app_flask.route('/thumb/<path:filename>/<thumbname>')
-def serve_thumb(filename, thumbname):
-    return send_from_directory(get_video_thumb_dir(filename), thumbname)
+@app_flask.route('/scrub/<path:filename>')
+def serve_scrub(filename):
+    return send_from_directory(SCRUB_FOLDER, f"{filename}.mp4")
+
+@app_flask.route('/saved_thumb/<path:filename>')
+def serve_saved_thumb(filename):
+    return send_from_directory(SAVED_THUMBS_FOLDER, f"{filename}.jpg")
 
 @app_flask.route('/api/get_videos')
 def get_videos():
     supported_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm')
+    meta = load_metadata()
     v_list = []
+
     if os.path.exists(VIDEOS_FOLDER):
         raw_files = [
             f for f in os.listdir(VIDEOS_FOLDER)
@@ -415,31 +469,99 @@ def get_videos():
         for f in sorted(raw_files, key=natural_sort_key):
             full_p = os.path.join(VIDEOS_FOLDER, f)
             size_mb = f"{os.path.getsize(full_p) / (1024 * 1024):.1f} MB"
-            t_dir = get_video_thumb_dir(f)
-            thumbs = sorted([t for t in os.listdir(t_dir) if t.endswith('.jpg')])
-            # If thumbs weren't generated yet for an existing video, generate now
-            if not thumbs:
+            entry = meta.get(f, {})
+
+            # Auto-generate scrub preview & initial thumb for pre-existing videos
+            scrub_p = os.path.join(SCRUB_FOLDER, f"{f}.mp4")
+            if not os.path.exists(scrub_p):
                 try:
-                    generate_5sec_hd_thumbs(full_p, f)
-                    thumbs = sorted([t for t in os.listdir(t_dir) if t.endswith('.jpg')])
+                    generate_scrub_video(full_p, f)
                 except Exception:
-                    thumbs = []
-            v_list.append({'fileName': f, 'size': size_mb, 'thumbs': thumbs})
-    return jsonify({"videos": v_list, "editor": editor_state})
+                    pass
+
+            thumb_p = os.path.join(SAVED_THUMBS_FOLDER, f"{f}.jpg")
+            if not os.path.exists(thumb_p):
+                try:
+                    _, _, dur, aspect = get_video_info(full_p)
+                    extract_hd_frame_at(full_p, f, min(3.0, dur / 2.0) if dur > 0 else 1.0)
+                    update_video_meta(f, aspect=aspect, duration=dur)
+                    entry = load_metadata().get(f, {})
+                except Exception:
+                    pass
+
+            v_list.append({
+                'fileName': f,
+                'size': size_mb,
+                'aspect': entry.get('aspect', '9:16'),
+                'caption': entry.get('caption', ''),
+                'hasThumb': os.path.exists(thumb_p),
+                'thumbVer': entry.get('thumbUpdated', 1)
+            })
+
+    return jsonify({"videos": v_list, "progress": progress_state, "completed": completed_uploads})
+
+@app_flask.route('/api/capture_frame', methods=['POST'])
+def api_capture_frame():
+    data = request.json or {}
+    filename = data.get("fileName", "")
+    ts = float(data.get("timestamp", 0.0))
+    hd_path = os.path.join(VIDEOS_FOLDER, filename)
+    if not os.path.exists(hd_path):
+        return jsonify({"ok": False}), 404
+
+    t_name = extract_hd_frame_at(hd_path, filename, ts)
+    return jsonify({"ok": bool(t_name), "thumbVer": time.time()})
+
+@app_flask.route('/api/paste_thumb', methods=['POST'])
+def api_paste_thumb():
+    data = request.json or {}
+    filename = data.get("fileName", "")
+    b64 = data.get("imageBase64", "")
+    if not filename or "," not in b64:
+        return jsonify({"ok": False}), 400
+
+    thumb_name = f"{filename}.jpg"
+    thumb_path = os.path.join(SAVED_THUMBS_FOLDER, thumb_name)
+    try:
+        img_bytes = base64.b64decode(b64.split(",")[1])
+        temp_p = os.path.join(TEMP_FOLDER, f"paste_{int(time.time()*1000)}.img")
+        with open(temp_p, "wb") as f:
+            f.write(img_bytes)
+        with Image.open(temp_p) as im:
+            im.convert("RGB").save(thumb_path, quality=95)
+        os.remove(temp_p)
+        now_v = time.time()
+        update_video_meta(filename, thumbFile=thumb_name, thumbUpdated=now_v)
+        return jsonify({"ok": True, "thumbVer": now_v})
+    except Exception:
+        return jsonify({"ok": False}), 500
+
+@app_flask.route('/api/save_caption', methods=['POST'])
+def api_save_caption():
+    data = request.json or {}
+    filename = data.get("fileName", "")
+    caption = data.get("caption", "")
+    if filename:
+        update_video_meta(filename, caption=caption)
+    return jsonify({"ok": True})
+
+@app_flask.route('/api/delete_video', methods=['POST'])
+def api_delete_video():
+    data = request.json or {}
+    filename = data.get("fileName", "")
+    if filename:
+        cleanup_video_files(filename)
+    return jsonify({"ok": True})
 
 @app_flask.route('/api/start_batch', methods=['POST'])
 def start_batch():
     payload = request.json or {}
     tasks = payload.get("tasks", [])
-    schedule_date = payload.get("schedule_date", "")
-    schedule_time = payload.get("schedule_time", "")
-
     if not tasks:
         return jsonify({"status": "no_tasks"}), 400
-
     threading.Thread(
         target=run_uploader_thread,
-        args=(tasks, schedule_date, schedule_time),
+        args=(tasks, payload.get("schedule_date", ""), payload.get("schedule_time", "")),
         daemon=True
     ).start()
     return jsonify({"status": "started"})
@@ -448,19 +570,23 @@ def start_batch():
 def stop_batch():
     global stop_flag
     stop_flag = True
-    batch_state["msg"] = "Stopping..."
     return jsonify({"status": "stopping"})
 
-@app_flask.route('/api/get_status')
-def get_status():
-    return jsonify(batch_state)
+@app_flask.route('/api/shutdown_server', methods=['POST'])
+def shutdown_server():
+    def _stop():
+        time.sleep(0.5)
+        os.system("gh codespace stop -c $CODESPACE_NAME || sudo shutdown -h now")
+    threading.Thread(target=_stop, daemon=True).start()
+    return jsonify({"status": "shutting_down"})
 
-# ================= WEB DASHBOARD UI (5s HD THUMBNAIL SLIDER + HOVER ZOOM) =================
+# ================= FINAL 65:35 MINIMALIST STUDIO UI =================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>HotLanka Cloud Studio</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -469,400 +595,639 @@ HTML_TEMPLATE = r"""
             font-family: 'Inter', sans-serif;
             background: #090712;
             color: #f1f5f9;
-            padding: 18px;
-        }
-        .container {
-            max-width: 1020px;
-            margin: 0 auto;
-            background: #0f0b1e;
-            border: 1px solid #24164a;
-            border-radius: 14px;
-            padding: 18px;
-        }
-        .top-bar {
+            height: 100vh;
             display: flex;
-            justify-content: space-between;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* TOP HEADER & REAL-TIME SIMPLE PROGRESS BAR */
+        .top-header {
+            background: #0f0b1f;
+            border-bottom: 1px solid #24164a;
+            padding: 12px 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .header-row-1 {
+            display: flex;
             align-items: center;
-            padding-bottom: 12px;
-            border-bottom: 1px solid #1f143d;
-            margin-bottom: 14px;
+            justify-content: space-between;
+            gap: 16px;
         }
-        .title { font-size: 17px; font-weight: 700; color: #f8fafc; }
-        .badge {
-            font-size: 12px;
-            color: #c084fc;
-            background: rgba(147, 51, 234, 0.15);
-            border: 1px solid rgba(147, 51, 234, 0.35);
-            padding: 4px 12px;
-            border-radius: 20px;
+        .brand {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
+            white-space: nowrap;
         }
-        .editor-banner {
-            background: #17102e;
-            border: 1px solid #3b2466;
-            color: #38bdf8;
-            font-size: 12px;
-            padding: 8px 12px;
-            border-radius: 8px;
-            margin-bottom: 12px;
-            display: none;
-        }
-        .controls {
+        .progress-wrap {
+            flex: 1;
+            max-width: 480px;
             display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .prog-text {
+            font-size: 12px;
+            font-weight: 500;
+            color: #cbd5e1;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .prog-track {
+            width: 100%;
+            height: 6px;
+            background: #1b1236;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .prog-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #8b5cf6, #22c55e);
+            transition: width 0.25s ease;
+        }
+        .sys-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .header-row-2 {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
             flex-wrap: wrap;
             gap: 8px;
-            margin-bottom: 14px;
-            align-items: center;
         }
-        input[type="text"], input[type="date"], input[type="time"] {
+        .count-pill {
+            font-size: 12px;
+            font-weight: 600;
+            color: #c084fc;
+            background: rgba(139, 92, 246, 0.14);
+            border: 1px solid rgba(139, 92, 246, 0.35);
+            padding: 5px 12px;
+            border-radius: 20px;
+        }
+        .schedule-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        input[type="text"], input[type="date"] {
             background: #080612;
             border: 1px solid #2b1c54;
-            border-radius: 8px;
-            padding: 8px 11px;
-            color: #fff;
+            border-radius: 7px;
+            padding: 6px 10px;
+            color: #f8fafc;
             font-size: 12.5px;
             outline: none;
         }
         input:focus { border-color: #8b5cf6; }
-        .bulk-cap { flex: 1; min-width: 200px; }
+
+        /* 24-Hour Time Selector Pill (from original script) */
+        .time-selector {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            background: #080612;
+            border: 1px solid #2b1c54;
+            border-radius: 7px;
+            padding: 5px 10px;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 12.5px;
+        }
+        .time-popup {
+            display: none;
+            position: absolute;
+            top: 115%;
+            right: 0;
+            background: #130d29;
+            border: 1px solid #4c2f8a;
+            border-radius: 9px;
+            padding: 8px;
+            z-index: 500;
+            box-shadow: 0 12px 30px rgba(0,0,0,0.85);
+            gap: 6px;
+        }
+        .time-popup.open { display: flex; }
+        .time-col {
+            max-height: 150px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            padding-right: 4px;
+        }
+        .time-opt {
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            cursor: pointer;
+            text-align: center;
+        }
+        .time-opt:hover, .time-opt.active { background: #7c3aed; color: #fff; }
+
         .btn {
-            background: #1d133b;
-            border: 1px solid #3c2773;
+            background: #1b1236;
+            border: 1px solid #38246b;
             color: #e9d5ff;
-            padding: 8px 13px;
-            border-radius: 8px;
+            padding: 6px 12px;
+            border-radius: 7px;
             font-size: 12px;
             font-weight: 600;
             cursor: pointer;
+            white-space: nowrap;
         }
-        .btn:hover { background: #2c1d59; }
+        .btn:hover { background: #291b52; }
         .btn-primary {
             background: linear-gradient(135deg, #8b5cf6, #7c3aed);
             border: none;
             color: #fff;
-            padding: 10px 20px;
-            font-size: 13px;
+            padding: 7px 16px;
         }
         .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+        .btn-stop-server {
+            background: rgba(239, 68, 68, 0.14);
+            border: 1px solid rgba(239, 68, 68, 0.45);
+            color: #fca5a5;
+        }
+        .btn-stop-server:hover { background: #dc2626; color: #fff; }
         .btn-danger { background: #ef4444; border: none; color: #fff; display: none; }
 
-        .video-list {
+        /* MAIN 65:35 SPLIT WORKSPACE */
+        .workspace {
+            flex: 1;
             display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-bottom: 16px;
-        }
-        .card {
-            background: #130d29;
-            border: 1px solid #26184f;
-            border-radius: 11px;
-            padding: 12px 14px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .card.done { border-color: #22c55e; opacity: 0.55; }
-        .card-head {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 13px;
-        }
-        .file-title { font-weight: 600; color: #e2e8f0; }
-
-        /* 5-Second HD Thumbnail Slider */
-        .slider-wrap {
-            display: flex;
-            gap: 8px;
-            overflow-x: auto;
-            padding: 6px;
-            background: #080612;
-            border: 1px solid #221545;
-            border-radius: 8px;
-        }
-        .slider-wrap::-webkit-scrollbar { height: 7px; }
-        .slider-wrap::-webkit-scrollbar-thumb { background: #4c2f8a; border-radius: 6px; }
-
-        .slide-item {
-            position: relative;
-            flex-shrink: 0;
-            width: 128px;
-            height: 74px;
-            border-radius: 6px;
+            gap: 14px;
+            padding: 14px 18px;
             overflow: hidden;
-            cursor: pointer;
-            border: 2px solid transparent;
-            transition: transform 0.15s, border-color 0.15s;
-        }
-        .slide-item:hover { border-color: #a855f7; transform: scale(1.03); }
-        .slide-item.active { border-color: #22c55e; box-shadow: 0 0 10px rgba(34, 197, 94, 0.5); }
-        .slide-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
-        .time-tag {
-            position: absolute;
-            bottom: 3px;
-            right: 4px;
-            background: rgba(0,0,0,0.78);
-            color: #f8fafc;
-            font-size: 10px;
-            font-family: monospace;
-            padding: 1px 5px;
-            border-radius: 4px;
         }
 
-        .bottom-row {
+        /* LEFT: 65% VIDEO LIST */
+        .left-list {
+            flex: 0 0 65%;
+            overflow-y: auto;
             display: flex;
+            flex-direction: column;
             gap: 10px;
-            align-items: center;
+            padding-right: 6px;
         }
-        .selected-preview-box {
-            width: 112px;
-            height: 64px;
-            border: 1px dashed #4c2f8a;
-            border-radius: 7px;
+        .left-list::-webkit-scrollbar { width: 6px; }
+        .left-list::-webkit-scrollbar-thumb { background: #311f61; border-radius: 6px; }
+
+        .v-card {
+            background: #0f0b1f;
+            border: 1px solid #221545;
+            border-radius: 11px;
+            padding: 10px 12px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        .v-card:hover { border-color: #4c2f8a; }
+        .v-card.active {
+            border-color: #8b5cf6;
+            background: #150f2b;
+        }
+
+        .thumb-box {
+            width: 78px;
+            height: 112px;
+            border-radius: 8px;
             background: #080612;
+            border: 1px dashed #43297a;
+            flex-shrink: 0;
+            position: relative;
+            overflow: hidden;
             display: flex;
             align-items: center;
             justify-content: center;
-            cursor: pointer;
+        }
+        .thumb-box.landscape {
+            width: 128px;
+            height: 76px;
+        }
+        .thumb-box img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .thumb-hint {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.72);
+            font-size: 9px;
+            color: #cbd5e1;
+            text-align: center;
+            padding: 2px;
+        }
+
+        .card-info {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+        }
+        .card-top-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+        }
+        .v-name {
+            font-size: 13.5px;
+            font-weight: 600;
+            color: #f8fafc;
+            white-space: nowrap;
             overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .v-meta {
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        .card-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
             flex-shrink: 0;
+        }
+        .card-actions input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #8b5cf6;
+            cursor: pointer;
+        }
+        .del-btn {
+            background: transparent;
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            color: #f87171;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .del-btn:hover { background: #ef4444; color: #fff; }
+
+        .cap-label {
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        .cap-box {
+            width: 100%;
+            background: #080612;
+            border: 1px solid #26184f;
+            border-radius: 7px;
+            padding: 7px 10px;
+            color: #f1f5f9;
+            font-size: 12.5px;
+        }
+
+        /* RIGHT: 35% PREVIEW PLAYER */
+        .right-player {
+            flex: 1;
+            background: #0f0b1f;
+            border: 1px solid #221545;
+            border-radius: 12px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .player-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+        }
+        .video-stage {
+            flex: 1;
+            background: #05040a;
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
             position: relative;
         }
-        .selected-preview-box:focus { border-color: #a855f7; }
-        .selected-preview-box img { width: 100%; height: 100%; object-fit: cover; display: none; }
-        .hint-txt { font-size: 10px; color: #8b76b8; text-align: center; padding: 3px; }
-        .cap-input { flex: 1; }
+        .video-stage video {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        .seek-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .seek-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11.5px;
+            color: #94a3b8;
+            font-family: monospace;
+        }
+        .seek-slider {
+            flex: 1;
+            accent-color: #8b5cf6;
+            cursor: pointer;
+        }
+        .btn-capture {
+            width: 100%;
+            background: linear-gradient(135deg, #8b5cf6, #6d28d9);
+            border: none;
+            color: #fff;
+            padding: 9px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-capture:hover { opacity: 0.92; }
+        .btn-capture:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        /* Large Hover Zoom Popup */
-        .hover-zoom-popup {
+        /* HOVER ZOOM POPUP */
+        .hover-zoom {
             position: fixed;
             pointer-events: none;
             z-index: 9999;
-            background: #0f0b1e;
-            border: 2px solid #a855f7;
+            background: #0f0b1f;
+            border: 2px solid #8b5cf6;
             border-radius: 10px;
-            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.92);
-            max-width: 440px;
-            max-height: 320px;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.92);
+            max-width: 360px;
+            max-height: 440px;
             object-fit: contain;
             display: none;
         }
 
-        .progress-section {
-            background: #080612;
-            border: 1px solid #1f143d;
-            border-radius: 10px;
-            padding: 12px;
-        }
-        .prog-top {
-            display: flex;
-            justify-content: space-between;
-            font-size: 12px;
-            color: #c4b5fd;
-            margin-bottom: 6px;
-        }
-        .bar-bg {
-            width: 100%;
-            height: 7px;
-            background: #1a1136;
-            border-radius: 10px;
-            overflow: hidden;
-            margin-bottom: 10px;
-        }
-        .bar-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #8b5cf6, #22c55e);
-            transition: width 0.25s;
-        }
-        .log-box {
-            font-family: monospace;
-            font-size: 11px;
-            color: #94a3b8;
-            max-height: 95px;
-            overflow-y: auto;
-            line-height: 1.5;
+        @media (max-width: 820px) {
+            body { height: auto; overflow-y: auto; }
+            .workspace { flex-direction: column-reverse; overflow: visible; }
+            .left-list { flex: none; overflow: visible; }
+            .video-stage { height: 280px; }
         }
     </style>
 </head>
 <body>
-    <img id="hover_zoom" class="hover-zoom-popup" src="">
+    <img id="hover_zoom" class="hover-zoom" src="">
 
-    <div class="container">
-        <div class="top-bar">
-            <span class="title">HotLanka Cloud Studio</span>
-            <span class="badge" id="vid_count">0 Videos Ready</span>
-        </div>
+    <div class="top-header">
+        <div class="header-row-1">
+            <span class="brand">HotLanka Cloud Studio</span>
 
-        <div class="editor-banner" id="editor_banner"></div>
-
-        <div class="controls">
-            <input type="text" id="bulk_caption" class="bulk-cap" placeholder="Bulk caption for all (leave empty for default)">
-            <input type="date" id="schedule_date" title="Schedule Date">
-            <input type="time" id="schedule_time" title="Schedule Time (24h)">
-            <button class="btn" onclick="applyBulkCaption()">Apply Caption</button>
-            <button class="btn" onclick="loadVideos()">Refresh</button>
-            <button class="btn btn-primary" id="start_btn" onclick="startBatch()">Start Batch Schedule</button>
-            <button class="btn btn-danger" id="stop_btn" onclick="stopBatch()">Stop</button>
-        </div>
-
-        <div class="video-list" id="video_list"></div>
-
-        <div class="progress-section">
-            <div class="prog-top">
-                <span id="status_msg">Ready</span>
-                <span id="status_pct">0%</span>
+            <div class="progress-wrap">
+                <div class="prog-text" id="prog_text">Ready</div>
+                <div class="prog-track"><div class="prog-fill" id="prog_fill"></div></div>
             </div>
-            <div class="bar-bg"><div class="bar-fill" id="status_bar"></div></div>
-            <div class="log-box" id="log_box">Waiting for videos...</div>
+
+            <div class="sys-actions">
+                <button class="btn" onclick="openCloudBrowser()">🌐 Open Cloud Browser</button>
+                <button class="btn btn-stop-server" onclick="shutdownServer()">⏻ Stop Server</button>
+            </div>
+        </div>
+
+        <div class="header-row-2">
+            <span class="count-pill" id="vid_count">0 Videos Ready</span>
+
+            <div class="schedule-controls">
+                <input type="text" id="bulk_caption" placeholder="Bulk caption..." style="width:170px;">
+                <input type="date" id="schedule_date">
+
+                <div class="time-selector" onclick="toggleTimePopup(event)">
+                    <span>🕒</span>
+                    <span id="time_display">Now</span>
+                    <span onclick="clearTime(event)" style="color:#94a3b8;padding-left:4px;">✕</span>
+                    <div class="time-popup" id="time_popup" onclick="event.stopPropagation()">
+                        <div class="time-col" id="hour_col"></div>
+                        <div class="time-col" id="min_col"></div>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="applyBulkCaption()">Apply Caption</button>
+                <button class="btn btn-primary" id="start_btn" onclick="startBatch()">Start Batch Schedule</button>
+                <button class="btn btn-danger" id="stop_btn" onclick="stopBatch()">Stop</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="workspace">
+        <div class="left-list" id="video_list"></div>
+
+        <div class="right-player">
+            <div class="player-title">
+                <span>Preview Player</span>
+                <span id="active_vid_label" style="color:#a78bfa;font-weight:500;">Select a video</span>
+            </div>
+
+            <div class="video-stage">
+                <video id="scrub_player" preload="auto" muted playsinline></video>
+            </div>
+
+            <div class="seek-controls">
+                <div class="seek-row">
+                    <button class="btn" id="play_btn" onclick="togglePlay()" style="padding:3px 8px;">▶</button>
+                    <input type="range" class="seek-slider" id="seek_slider" min="0" max="100" step="0.1" value="0">
+                    <span id="time_readout">00:00 / 00:00</span>
+                </div>
+                <button class="btn-capture" id="capture_btn" onclick="captureCurrentFrame()" disabled>📸 Capture Frame</button>
+            </div>
         </div>
     </div>
 
     <script>
-        let videoItems = [];
+        let videos = [];
+        let activeFileName = null;
+        let selectedHour = "";
+        let selectedMin = "";
+        let blobCache = {};
+        let captionTimers = {};
 
-        function formatSec(sec) {
-            const m = Math.floor(sec / 60);
-            const s = sec % 60;
-            return `${m}:${s.toString().padStart(2, '0')}`;
+        // Build 24h Time Picker
+        (function initTimePicker() {
+            const hCol = document.getElementById("hour_col");
+            const mCol = document.getElementById("min_col");
+            for (let h = 0; h < 24; h++) {
+                const hs = h.toString().padStart(2, '0');
+                const d = document.createElement("div");
+                d.className = "time-opt";
+                d.innerText = hs;
+                d.onclick = () => { selectedHour = hs; if (!selectedMin) selectedMin = "00"; updateTimeLabel(); };
+                hCol.appendChild(d);
+            }
+            for (let m = 0; m < 60; m += 5) {
+                const ms = m.toString().padStart(2, '0');
+                const d = document.createElement("div");
+                d.className = "time-opt";
+                d.innerText = ms;
+                d.onclick = () => { selectedMin = ms; if (!selectedHour) selectedHour = "12"; updateTimeLabel(); };
+                mCol.appendChild(d);
+            }
+            document.addEventListener("click", () => document.getElementById("time_popup").classList.remove("open"));
+        })();
+
+        function toggleTimePopup(e) {
+            e.stopPropagation();
+            document.getElementById("time_popup").classList.toggle("open");
+        }
+        function clearTime(e) {
+            e.stopPropagation();
+            selectedHour = "";
+            selectedMin = "";
+            document.getElementById("time_display").innerText = "Now";
+            document.getElementById("time_popup").classList.remove("open");
+        }
+        function updateTimeLabel() {
+            document.getElementById("time_display").innerText = `${selectedHour}:${selectedMin}`;
         }
 
+        function openCloudBrowser() {
+            const vncUrl = window.location.origin.replace("-5000.", "-6080.") + "/vnc.html?autoconnect=true&resize=scale";
+            window.open(vncUrl, "_blank");
+        }
+
+        async function shutdownServer() {
+            if (!confirm("Shutdown Codespace server now to save CPU hours?")) return;
+            document.getElementById("prog_text").innerText = "Shutting down server...";
+            await fetch('/api/shutdown_server', { method: 'POST' });
+        }
+
+        // Hover Zoom
         function showZoom(src, e) {
             if (!src) return;
-            const pop = document.getElementById("hover_zoom");
-            pop.src = src;
-            pop.style.display = "block";
+            const z = document.getElementById("hover_zoom");
+            z.src = src;
+            z.style.display = "block";
             moveZoom(e);
         }
-
         function moveZoom(e) {
-            const pop = document.getElementById("hover_zoom");
-            if (pop.style.display !== "block") return;
-            const popW = 440, popH = 260;
+            const z = document.getElementById("hover_zoom");
+            if (z.style.display !== "block") return;
             let left = e.clientX + 18;
-            let top = e.clientY - 120;
-            if (left + popW > window.innerWidth) left = e.clientX - popW - 18;
+            let top = e.clientY - 140;
+            if (left + 370 > window.innerWidth) left = e.clientX - 370;
             if (top < 10) top = 10;
-            if (top + popH > window.innerHeight) top = window.innerHeight - popH - 10;
-            pop.style.left = left + "px";
-            pop.style.top = top + "px";
+            if (top + 380 > window.innerHeight) top = window.innerHeight - 380;
+            z.style.left = left + "px";
+            z.style.top = top + "px";
         }
-
         function hideZoom() {
-            const pop = document.getElementById("hover_zoom");
-            pop.style.display = "none";
-            pop.src = "";
+            const z = document.getElementById("hover_zoom");
+            z.style.display = "none";
         }
 
-        async function loadVideos() {
-            const res = await fetch('/api/get_videos');
-            const data = await res.json();
+        // Local-like 0ms Lag Scrubbing Player
+        const player = document.getElementById("scrub_player");
+        const slider = document.getElementById("seek_slider");
 
-            const banner = document.getElementById("editor_banner");
-            if (data.editor && data.editor.active) {
-                banner.style.display = "block";
-                banner.innerText = `Auto-Editor Running: ${data.editor.file} (${data.editor.step})`;
+        function fmtTime(sec) {
+            if (!isFinite(sec)) return "00:00";
+            const m = Math.floor(sec / 60).toString().padStart(2, '0');
+            const s = Math.floor(sec % 60).toString().padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
+        slider.addEventListener("input", () => {
+            if (player.duration) {
+                player.currentTime = (slider.value / 100) * player.duration;
+                document.getElementById("time_readout").innerText = `${fmtTime(player.currentTime)} / ${fmtTime(player.duration)}`;
+            }
+        });
+
+        player.addEventListener("timeupdate", () => {
+            if (player.duration) {
+                slider.value = (player.currentTime / player.duration) * 100;
+                document.getElementById("time_readout").innerText = `${fmtTime(player.currentTime)} / ${fmtTime(player.duration)}`;
+            }
+        });
+
+        function togglePlay() {
+            if (!player.src) return;
+            if (player.paused) {
+                player.play();
+                document.getElementById("play_btn").innerText = "⏸";
             } else {
-                banner.style.display = "none";
+                player.pause();
+                document.getElementById("play_btn").innerText = "▶";
             }
+        }
 
-            const existing = new Map(videoItems.map(v => [v.fileName, v]));
-            videoItems = data.videos.map(v => {
-                if (existing.has(v.fileName)) {
-                    return { ...existing.get(v.fileName), size: v.size, thumbs: v.thumbs };
-                }
-                const defaultThumb = (v.thumbs && v.thumbs.length > 0) ? v.thumbs[0] : "";
-                return {
-                    fileName: v.fileName,
-                    size: v.size,
-                    thumbs: v.thumbs || [],
-                    selected: true,
-                    caption: "",
-                    selectedThumbFile: defaultThumb,
-                    imageBase64: "",
-                    done: false
-                };
+        async function selectVideoForPreview(fileName) {
+            if (activeFileName === fileName && player.src) return;
+            activeFileName = fileName;
+            document.getElementById("active_vid_label").innerText = fileName;
+            document.getElementById("capture_btn").disabled = false;
+            document.getElementById("play_btn").innerText = "▶";
+
+            document.querySelectorAll(".v-card").forEach(c => {
+                c.classList.toggle("active", c.dataset.file === fileName);
             });
 
-            renderList();
+            if (!blobCache[fileName]) {
+                const resp = await fetch(`/scrub/${encodeURIComponent(fileName)}`);
+                const blob = await resp.blob();
+                blobCache[fileName] = URL.createObjectURL(blob);
+            }
+            player.src = blobCache[fileName];
+            player.currentTime = 0;
         }
 
-        function renderList() {
-            const list = document.getElementById("video_list");
-            document.getElementById("vid_count").innerText = `${videoItems.length} Videos Ready`;
-            document.getElementById("start_btn").disabled = videoItems.length === 0;
+        async function captureCurrentFrame() {
+            if (!activeFileName) return;
+            const btn = document.getElementById("capture_btn");
+            btn.disabled = true;
+            btn.innerText = "Capturing HD...";
 
-            if (videoItems.length === 0) {
-                list.innerHTML = `<div style="color:#64748b;font-size:12px;padding:30px;text-align:center;">No edited videos yet. Download via Chrome (VDH) — they will appear here automatically.</div>`;
-                return;
+            const res = await fetch('/api/capture_frame', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileName: activeFileName, timestamp: player.currentTime })
+            });
+            const data = await res.json();
+            if (data.ok) {
+                const v = videos.find(x => x.fileName === activeFileName);
+                if (v) v.thumbVer = data.thumbVer;
+                const imgEl = document.querySelector(`.v-card[data-file="${CSS.escape(activeFileName)}"] .thumb-box img`);
+                if (imgEl) imgEl.src = `/saved_thumb/${encodeURIComponent(activeFileName)}?v=${data.thumbVer}`;
             }
 
-            list.innerHTML = "";
-            videoItems.forEach((item, idx) => {
-                const card = document.createElement("div");
-                card.className = "card" + (item.done ? " done" : "");
-
-                let slidesHtml = "";
-                item.thumbs.forEach((tFile, tIdx) => {
-                    const thumbUrl = `/thumb/${encodeURIComponent(item.fileName)}/${tFile}`;
-                    const isActive = (!item.imageBase64 && item.selectedThumbFile === tFile) ? "active" : "";
-                    const secLabel = formatSec((tIdx + 1) * 5);
-                    slidesHtml += `
-                        <div class="slide-item ${isActive}"
-                             onclick="selectSlideThumb(${idx}, '${tFile}')"
-                             onmouseenter="showZoom('${thumbUrl}', event)"
-                             onmousemove="moveZoom(event)"
-                             onmouseleave="hideZoom()">
-                            <img src="${thumbUrl}" loading="lazy">
-                            <span class="time-tag">${secLabel}</span>
-                        </div>
-                    `;
-                });
-
-                const activePreviewSrc = item.imageBase64
-                    ? item.imageBase64
-                    : (item.selectedThumbFile ? `/thumb/${encodeURIComponent(item.fileName)}/${item.selectedThumbFile}` : "");
-
-                card.innerHTML = `
-                    <div class="card-head">
-                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                            <input type="checkbox" ${item.selected ? "checked" : ""} onchange="videoItems[${idx}].selected = this.checked">
-                            <span class="file-title">${item.fileName}</span>
-                        </label>
-                        <span style="font-size:11.5px;color:#94a3b8;">${item.size}</span>
-                    </div>
-                    <div class="slider-wrap">${slidesHtml || '<span style="font-size:11px;color:#64748b;padding:10px;">Generating 5s thumbnails...</span>'}</div>
-                    <div class="bottom-row">
-                        <div class="selected-preview-box" tabindex="0"
-                             onpaste="handlePaste(${idx}, event)"
-                             onmouseenter="showZoom('${activePreviewSrc}', event)"
-                             onmousemove="moveZoom(event)"
-                             onmouseleave="hideZoom()"
-                             title="Selected Thumbnail (Click & Ctrl+V to paste custom photo)">
-                            <span class="hint-txt" style="${activePreviewSrc ? 'display:none;' : ''}">Click & Ctrl+V</span>
-                            <img src="${activePreviewSrc}" style="${activePreviewSrc ? 'display:block;' : ''}">
-                        </div>
-                        <input type="text" class="cap-input" placeholder="Custom caption (Leave empty for default)" value="${item.caption}" oninput="videoItems[${idx}].caption = this.value">
-                    </div>
-                `;
-                list.appendChild(card);
-            });
+            btn.innerText = "📸 Capture Frame";
+            btn.disabled = false;
         }
 
-        function selectSlideThumb(idx, tFile) {
-            videoItems[idx].selectedThumbFile = tFile;
-            videoItems[idx].imageBase64 = "";
-            renderList();
-        }
-
-        function handlePaste(idx, event) {
+        function handlePaste(fileName, event) {
+            event.stopPropagation();
             const items = (event.clipboardData || event.originalEvent.clipboardData).items;
             for (let it of items) {
                 if (it.type.indexOf("image") !== -1) {
                     const reader = new FileReader();
-                    reader.onload = e => {
-                        videoItems[idx].imageBase64 = e.target.result;
-                        videoItems[idx].selectedThumbFile = "";
-                        renderList();
+                    reader.onload = async e => {
+                        const res = await fetch('/api/paste_thumb', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ fileName, imageBase64: e.target.result })
+                        });
+                        const data = await res.json();
+                        if (data.ok) {
+                            const imgEl = document.querySelector(`.v-card[data-file="${CSS.escape(fileName)}"] .thumb-box img`);
+                            if (imgEl) imgEl.src = `/saved_thumb/${encodeURIComponent(fileName)}?v=${data.thumbVer}`;
+                        }
                     };
                     reader.readAsDataURL(it.getAsFile());
                     event.preventDefault();
@@ -871,26 +1236,165 @@ HTML_TEMPLATE = r"""
             }
         }
 
+        function onCaptionInput(fileName, val) {
+            const v = videos.find(x => x.fileName === fileName);
+            if (v) v.caption = val;
+            clearTimeout(captionTimers[fileName]);
+            captionTimers[fileName] = setTimeout(() => {
+                fetch('/api/save_caption', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fileName, caption: val })
+                });
+            }, 400);
+        }
+
+        async function deleteVideo(fileName, e) {
+            e.stopPropagation();
+            await fetch('/api/delete_video', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileName })
+            });
+            videos = videos.filter(v => v.fileName !== fileName);
+            const card = document.querySelector(`.v-card[data-file="${CSS.escape(fileName)}"]`);
+            if (card) card.remove();
+            updateCountBadge();
+            if (activeFileName === fileName) {
+                activeFileName = null;
+                player.removeAttribute("src");
+                document.getElementById("active_vid_label").innerText = "Select a video";
+                document.getElementById("capture_btn").disabled = true;
+            }
+        }
+
         function applyBulkCaption() {
             const val = document.getElementById("bulk_caption").value;
-            videoItems.forEach(v => v.caption = val);
-            renderList();
+            videos.forEach(v => {
+                v.caption = val;
+                const inp = document.querySelector(`.v-card[data-file="${CSS.escape(v.fileName)}"] .cap-box`);
+                if (inp) inp.value = val;
+                fetch('/api/save_caption', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fileName: v.fileName, caption: val })
+                });
+            });
+        }
+
+        function updateCountBadge() {
+            document.getElementById("vid_count").innerText = `${videos.length} Videos Ready`;
+            document.getElementById("start_btn").disabled = videos.length === 0;
+        }
+
+        function createCardElement(v) {
+            const card = document.createElement("div");
+            card.className = "v-card" + (activeFileName === v.fileName ? " active" : "");
+            card.dataset.file = v.fileName;
+            card.onclick = () => selectVideoForPreview(v.fileName);
+
+            const thumbUrl = `/saved_thumb/${encodeURIComponent(v.fileName)}?v=${v.thumbVer}`;
+            const isLand = v.aspect === "16:9" ? "landscape" : "";
+
+            card.innerHTML = `
+                <div class="thumb-box ${isLand}" tabindex="0"
+                     onclick="event.stopPropagation(); this.focus();"
+                     onpaste="handlePaste('${v.fileName.replace(/'/g, "\\'")}', event)"
+                     onmouseenter="showZoom(this.querySelector('img').src, event)"
+                     onmousemove="moveZoom(event)"
+                     onmouseleave="hideZoom()">
+                    <img src="${thumbUrl}" alt="">
+                    <span class="thumb-hint">Hover + Ctrl+V</span>
+                </div>
+                <div class="card-info">
+                    <div class="card-top-row">
+                        <div>
+                            <div class="v-name">${v.fileName}</div>
+                            <div class="v-meta">${v.size} • ${v.aspect}</div>
+                        </div>
+                        <div class="card-actions" onclick="event.stopPropagation()">
+                            <input type="checkbox" checked onchange="toggleSelect('${v.fileName.replace(/'/g, "\\'")}', this.checked)">
+                            <button class="del-btn" onclick="deleteVideo('${v.fileName.replace(/'/g, "\\'")}', event)">🗑️ Delete</button>
+                        </div>
+                    </div>
+                    <span class="cap-label">Caption</span>
+                    <input type="text" class="cap-box" placeholder="🔥Hot Lanka Exclusive 🔥"
+                           value="${(v.caption || '').replace(/"/g, '&quot;')}"
+                           onclick="event.stopPropagation()"
+                           oninput="onCaptionInput('${v.fileName.replace(/'/g, "\\'")}', this.value)">
+                </div>
+            `;
+            return card;
+        }
+
+        function toggleSelect(fileName, checked) {
+            const v = videos.find(x => x.fileName === fileName);
+            if (v) v.selected = checked;
+        }
+
+        // Seamless Live Sync (No page reload, preserves active scrubbing player)
+        async function syncDashboard() {
+            try {
+                const res = await fetch('/api/get_videos');
+                const data = await res.json();
+
+                // Update top progress bar
+                if (data.progress) {
+                    document.getElementById("prog_text").innerText = data.progress.msg;
+                    document.getElementById("prog_fill").style.width = data.progress.pct + "%";
+                    const isUploading = data.progress.mode === "uploading";
+                    document.getElementById("stop_btn").style.display = isUploading ? "inline-block" : "none";
+                    if (!isUploading) {
+                        document.getElementById("start_btn").disabled = data.videos.length === 0;
+                    }
+                }
+
+                const listEl = document.getElementById("video_list");
+                const serverNames = new Set(data.videos.map(x => x.fileName));
+
+                // Remove deleted/uploaded videos smoothly
+                videos = videos.filter(v => {
+                    if (!serverNames.has(v.fileName)) {
+                        const el = document.querySelector(`.v-card[data-file="${CSS.escape(v.fileName)}"]`);
+                        if (el) el.remove();
+                        return false;
+                    }
+                    return true;
+                });
+
+                // Append newly edited videos smoothly
+                const localNames = new Set(videos.map(x => x.fileName));
+                data.videos.forEach(sv => {
+                    if (!localNames.has(sv.fileName)) {
+                        const newObj = { ...sv, selected: true };
+                        videos.push(newObj);
+                        listEl.appendChild(createCardElement(newObj));
+                    }
+                });
+
+                updateCountBadge();
+
+                if (!activeFileName && videos.length > 0) {
+                    selectVideoForPreview(videos[0].fileName);
+                }
+            } catch (e) {}
         }
 
         async function startBatch() {
-            const tasks = videoItems.filter(v => v.selected && !v.done);
+            const tasks = videos.filter(v => v.selected);
             if (tasks.length === 0) return alert("Select at least one video!");
 
             document.getElementById("start_btn").disabled = true;
             document.getElementById("stop_btn").style.display = "inline-block";
 
+            const timeStr = (selectedHour && selectedMin) ? `${selectedHour}:${selectedMin}` : "";
             await fetch('/api/start_batch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     tasks,
                     schedule_date: document.getElementById("schedule_date").value,
-                    schedule_time: document.getElementById("schedule_time").value
+                    schedule_time: timeStr
                 })
             });
         }
@@ -899,37 +1403,8 @@ HTML_TEMPLATE = r"""
             await fetch('/api/stop_batch', { method: 'POST' });
         }
 
-        setInterval(async () => {
-            const st = await (await fetch('/api/get_status')).json();
-            document.getElementById("status_msg").innerText = st.msg;
-            document.getElementById("status_pct").innerText = st.pct + "%";
-            document.getElementById("status_bar").style.width = st.pct + "%";
-
-            if (st.logs && st.logs.length > 0) {
-                const box = document.getElementById("log_box");
-                box.innerHTML = st.logs.join("<br>");
-                box.scrollTop = box.scrollHeight;
-            }
-
-            if (st.completed_files && st.completed_files.length > 0) {
-                let changed = false;
-                videoItems.forEach(v => {
-                    if (st.completed_files.includes(v.fileName) && !v.done) {
-                        v.done = true;
-                        changed = true;
-                    }
-                });
-                if (changed) renderList();
-            }
-
-            if (!st.running) {
-                document.getElementById("start_btn").disabled = videoItems.length === 0;
-                document.getElementById("stop_btn").style.display = "none";
-            }
-        }, 1000);
-
-        setInterval(loadVideos, 5000);
-        loadVideos();
+        setInterval(syncDashboard, 1500);
+        syncDashboard();
     </script>
 </body>
 </html>
